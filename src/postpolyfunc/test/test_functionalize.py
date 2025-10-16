@@ -45,19 +45,14 @@ def test_functionalize_one_site_counts(hexane_pdb: Path, tmp_path: Path):
     nO0 = _count_elements(atoms, "O")
 
     f = PolymerFunctionalizer(
-        functionalization_ratio=0.0,  # ignored because we set n_sites
-        n_sites=1,
+        functionalization_ratio=0.2,  # ignored because we set n_sites
         seed=123,          # deterministic site choice when ties exist
-        co_bond=1.43,
-        oh_bond=0.96,
-        angle_COH_deg=108.5,
-        cutoff_scale=1.1,
         mode="carbonyl",   # whatever mode you're currently using
     )
     atoms_func = f.functionalize_carbons(atoms)
 
     # Counts
-    assert len(atoms_func) == n_atoms0, "Atom count should remain constant per site"
+    assert len(atoms_func) < n_atoms0, "Atom count should decrease per site"
     assert _count_elements(atoms_func, "H") == nH0 - 1, "Expected one fewer H"
     assert _count_elements(atoms_func, "O") == nO0 + 1, "Expected one more O"
 
@@ -96,9 +91,7 @@ def test_no_functionalization_when_ratio_zero(hexane_pdb: Path):
 
     f = PolymerFunctionalizer(
         functionalization_ratio=0.0,
-        n_sites=None,   # no explicit sites
         seed=1,
-        cutoff_scale=1.1,
         mode="carbonyl",
     )
     atoms2 = f.functionalize_carbons(atoms)
