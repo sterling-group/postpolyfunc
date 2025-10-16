@@ -10,7 +10,7 @@ import argparse
 from pathlib import Path
 from ase.io import read, write
 
-from .func import functionalize_carbons, PolymerFunctionalizer  # whichever you use
+from .func import PolymerFunctionalizer  # whichever you use
 from .utils import setup_logging  # optional
 from .postpolyfunc import run_functionalization
 
@@ -21,16 +21,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--version", action="version", version="postpolyfunc 0.1.0")
 
-    sub = p.add_subparsers(dest="cmd", required=True)
+    
 
     # --- functionalize subcommand ---
-    f = sub.add_parser("functionalize", help="Apply functionalization to a polymer PDB")
-    f.add_argument("--solute", required=True, type=Path, help="Polymer PDB (input)")
-    f.add_argument("--out", required=True, type=Path, help="Output PDB path")
-    f.add_argument("-r", "--ratio", type=float, default=0.1, help="Fraction of eligible C to functionalize")
-    f.add_argument("-n", "--n-sites", type=int, default=None, help="Exactly N sites (overrides --ratio)")
-    f.add_argument("--seed", type=int, default=42)
-    f.add_argument("-v", "--verbose", action="count", default=1)
+    p.add_argument("--solute", required=True, type=Path, help="Polymer PDB (input)")
+    p.add_argument("--out", required=True, type=Path, help="Output PDB path")
+    p.add_argument("-r", "--ratio", type=float, default=0.1, help="Fraction of eligible C to functionalize")
+    p.add_argument("-n", "--n-sites", type=int, default=None, help="Exactly N sites (overrides --ratio)")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("-v", "--verbose", action="count", default=1)
 
     # --- roadmap: pack/ligpargen/merge subcommands later ---
     # sub.add_parser("topogen", help="Run LigParGen, pack box, and merge topologies")
