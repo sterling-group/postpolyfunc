@@ -53,7 +53,7 @@ Next stages (LigParGen, topology merge) will plug in below.
 import argparse
 from pathlib import Path
 from ase.io import read, write
-from func import PolymerFunctionalizer
+from src.func import PolymerFunctionalizer
 
 
 def main():
