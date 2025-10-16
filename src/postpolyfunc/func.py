@@ -22,6 +22,7 @@ class PolymerFunctionalizer:
         self.functionalization_ratio = functionalization_ratio
         self.seed = seed
         self.mode = mode
+        
     def functionalize_carbons(self, atoms: Atoms) -> Atoms:
         if self.mode == "carbonyl":
             return self._carbonyl(atoms)
