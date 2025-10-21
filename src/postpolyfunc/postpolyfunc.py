@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 from .func import PolymerFunctionalizer
 from .ligpargen import generate_parameters
-
+from .utils import keep_only_root_gmx, setup_logging
 
 def run_functionalization(solute_path: Path, outdir: Path, ratio: float, seed: int, mode: str) -> Path:
     from ase.io import read, write
@@ -21,11 +21,10 @@ def run_functionalization(solute_path: Path, outdir: Path, ratio: float, seed: i
 
 
 def run_workflow(args) -> int:
-    """Main sequential workflow (CLI entry point)."""
     outdir = args.outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # 1️⃣ Functionalization
+    # 1) Functionalization
     print(f"[INFO] Functionalizing solute: {args.solute}")
     func_path = run_functionalization(
         solute_path=args.solute,
@@ -42,25 +41,21 @@ def run_workflow(args) -> int:
 
     # 2️⃣ LigParGen for solute
     print("[INFO] Running LigParGen for functionalized solute...")
-    solute_dir = outdir / "solute"
-    solute_dir.mkdir(exist_ok=True)
     solute_artifacts = generate_parameters(
-        workdir=solute_dir,
+        workdir=outdir,
         resname=args.solute.stem[:3].upper(),
-        molname=f"{args.solute.stem}_func",
+        molname="solute",
         ifile=func_path,
         charge=args.solute_charge,
         cgen=args.lp_cgen,
         opt=args.lp_opt,
         executable=args.lp_exe,
     )
-
+  
     # 3️⃣ LigParGen for solvent
     print("[INFO] Running LigParGen for solvent...")
-    solvent_dir = outdir / "solvent"
-    solvent_dir.mkdir(exist_ok=True)
     solvent_artifacts = generate_parameters(
-        workdir=solvent_dir,
+        workdir=outdir,
         resname="SOL",
         molname="solvent",
         ifile=args.solvent if args.solvent else None,
@@ -70,6 +65,8 @@ def run_workflow(args) -> int:
         opt=args.lp_opt,
         executable=args.lp_exe,
     )
+   
+    keep_only_root_gmx(outdir)
 
     # ✅ Summaries
     print("\n[SUMMARY] LigParGen outputs:")
