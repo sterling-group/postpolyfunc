@@ -1,59 +1,137 @@
+# gmx.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Union, List, Tuple
 import shutil
 import gmxapi as gmx
 
+
+# ──────────────────────────
+# Internal GROMACS helpers
+# ──────────────────────────
+
+def _read_box_xyz_from_gro(gro_path: str) -> tuple[float, float, float]:
+    """
+    Parse box vectors (nm) from last line of a .gro file.
+    For orthorhombic boxes expect 3 floats; for triclinic, we take first 3.
+    """
+    last = Path(gro_path).read_text().strip().splitlines()[-1].split()
+    if len(last) < 3:
+        raise ValueError(f"Could not parse box from {gro_path}")
+    return float(last[0]), float(last[1]), float(last[2])
+
+
+def _count_residues_in_gro(gro_path: str, resname: str) -> int:
+    """
+    Count residues by residue number for a given residue name in a .gro.
+    Assumes classic .gro formatting; uses columns [0:5]=resnr, [5:10]=resname.
+    """
+    with open(gro_path, "r") as f:
+        lines = f.readlines()
+    if len(lines) < 3:
+        return 0
+    natoms = int(lines[1].strip())
+    seen: set[int] = set()
+    for line in lines[2:2 + natoms]:
+        rn = line[5:10].strip()
+        if rn == resname:
+            try:
+                resnr = int(line[:5])
+                seen.add(resnr)
+            except ValueError:
+                # tolerate malformed lines
+                continue
+    return len(seen)
+
+
+def write_merged_topology(
+    out_top: Path,
+    *,
+    forcefield_includes: list[str],
+    solute_itp: Path,
+    solvent_itp: Path,
+    solute_name: str,
+    solvent_name: str,
+    solvated_gro: Path,
+    solvent_resname: str = "SOL",
+    n_solute: int = 1,
+) -> Path:
+    """
+    Minimal, reproducible merged topology that includes both ITPs and writes a [ molecules ] table.
+    Counts solvent molecules directly from the solvated .gro.
+    """
+    ns = _count_residues_in_gro(str(solvated_gro), solvent_resname)
+
+    lines: list[str] = []
+    lines += [*forcefield_includes, ""]
+    lines += [f'#include "{solute_itp.name}"', f'#include "{solvent_itp.name}"', ""]
+    lines += ["[ system ]", "Mixed solute + solvent", ""]
+    lines += ["[ molecules ]", f"{solute_name}    {n_solute}", f"{solvent_name}   {ns}", ""]
+    out_top.write_text("\n".join(lines))
+    return out_top
+
+
+# ──────────────────────────
+# Orchestration types
+# ──────────────────────────
 
 @dataclass
 class StepOutput:
     name: str
     files: Dict[str, str] = field(default_factory=dict)  # logical key -> absolute path
-    meta: Dict[str, Any] = field(default_factory=dict)   # anything else (timings, logs, params)
+    meta: Dict[str, Any] = field(default_factory=dict)
 
+
+# ──────────────────────────
+# Main API
+# ──────────────────────────
 
 class GmxAPI:
     """
-    Thin wrapper around gmxapi + an orchestrator to run multiple steps in sequence.
-    You keep filenames internal; only parameters like box size come from CLI.
+    Thin, explicit wrapper around gmxapi with a small step registry and an orchestrator.
+
+    Design principles:
+      • Filenames are internal/stable; only physical params (box, nmol, scale) come from CLI (via args).
+      • Each step returns a StepOutput with realized file paths and optional metadata.
+      • Orchestrate by step names; downstream steps receive upstream outputs via context promotion.
     """
 
     def __init__(
         self,
         executable: str = "gmx_mpi",
         workdir: Union[str, Path, None] = None,
-        args: Any = None,  # argparse.Namespace with things like .box, if you have it
+        args: Any = None,  # argparse.Namespace-like; may hold .box, .scale, etc.
     ):
         self.executable = executable
         self.workdir = Path(workdir) if workdir else Path.cwd()
         self.args = args
         self.workdir.mkdir(parents=True, exist_ok=True)
 
-        # Registry maps step name -> bound method
-        self._registry: Dict[str, Callable[..., StepOutput]] = {
-            "create_box": self.create_boxed_structure_step,
-            # Add more as you implement them:
-            "grompp_em": self.grompp_em_step,   # example (energy-min input)
-            "mdrun_em": self.mdrun_em_step,     # example (energy-min MD)
-            # "solvate": self.solvate_step,
-            # "ions": self.genion_step,
-            # "nvt": self.nvt_step,
-            # ...
+        # Step registry: map name -> bound method
+        self._registry: Dict[str, Any] = {
+            "create_box": self.create_boxed_structure_step,  # solute-only box (editconf)
+            "solvent_box": self.solvent_box_step,            # build pure solvent box sized to solute box
+            "grompp_em": self.grompp_em_step,                # EM preproc
+            "mdrun_em": self.mdrun_em_step,                  # EM run
+            "grompp_nvt": self.grompp_nvt_step,              # NVT preproc
+            "mdrun_nvt": self.mdrun_nvt_step,                # NVT run
+            "combine_solvate": self.combine_solvate_step,    # merge solute + solvent via gmx solvate
         }
 
-    # ---------- Low-level helper ----------
+    # ── low-level runner ───────────────────────────────────────────────────────
 
     def _run_cmd(
         self,
+        *,
         arguments: List[str],
         input_files: Optional[Dict[str, str]] = None,
         output_files: Optional[Dict[str, str]] = None,
     ) -> Dict[str, str]:
         """
-        Thin wrapper around gmx.commandline_operation using keyword args (prevents signature errors).
-        Returns a dict of realized output file paths keyed by their CLI flag (e.g., "-o").
+        Wrap gmx.commandline_operation with keyword args (correct signature).
+        Returns a dict mapping output flags (e.g., '-o') to realized absolute paths.
         """
         op = gmx.commandline_operation(
             command=[self.executable],
@@ -68,19 +146,19 @@ class GmxAPI:
             realized[flag] = str(Path(op.output.file[flag].result()).resolve())
         return realized
 
-    # ---------- Steps (return StepOutput) ----------
+    # ── steps ─────────────────────────────────────────────────────────────────
 
     def create_boxed_structure_step(
         self,
+        *,
         input_pdb: str,
         box: Optional[Iterable[float]] = None,
         boxtype: str = "cubic",
-        center: bool = False,  # upstream already centers; keep False by default
-        outname: str = "solute_boxed.gro",
+        center: bool = False,                  # upstream already centers
+        outname: str = "solute_boxed.gro",     # internal
     ) -> StepOutput:
-        """
-        Solute-only box creation (editconf). Output name is internal/stable for downstream steps.
-        """
+        """Create a box around the (already-centered) solute using editconf."""
+        # Resolve box
         if box is None and self.args is not None:
             box = getattr(self.args, "box", None)
         if box is None:
@@ -90,13 +168,14 @@ class GmxAPI:
             raise ValueError(f"box must be 3 numbers, got {box}")
 
         out_path = (self.workdir / outname).resolve()
-        arguments = ["editconf"]
+
+        args = ["editconf"]
         if center:
-            arguments.append("-c")
-        arguments += ["-bt", boxtype, "-box", str(box[0]), str(box[1]), str(box[2])]
+            args.append("-c")
+        args += ["-bt", boxtype, "-box", str(box[0]), str(box[1]), str(box[2])]
 
         realized = self._run_cmd(
-            arguments=arguments,
+            arguments=args,
             input_files={"-f": str(input_pdb)},
             output_files={"-o": str(out_path)},
         )
@@ -109,71 +188,157 @@ class GmxAPI:
         return StepOutput(
             name="create_box",
             files={"gro": str(out_path)},
-            meta={"boxtype": boxtype, "box": tuple(float(x) for x in box), "center": center},
+            meta={"box": tuple(float(x) for x in box), "boxtype": boxtype, "center": center},
+        )
+
+    def solvent_box_step(
+        self,
+        *,
+        solvent_gro: str,            # LigParGen solvent GRO (single or small box)
+        solute_box_gro: str,         # the solute-box .gro to copy box size from
+        nmol: int,                   # target # of solvent molecules
+        scale: Optional[float] = None,
+        solvent_resname: str = "SOL",
+        outname: str = "solvent_box.gro",
+    ) -> StepOutput:
+        """
+        Build a pure solvent box with the same dimensions as the solute box.
+        Uses `gmx solvate -box ... -cs ... -maxsol N -scale S`.
+        """
+        lx, ly, lz = _read_box_xyz_from_gro(solute_box_gro)
+        if scale is None and self.args is not None:
+            scale = getattr(self.args, "scale", None)
+        if scale is None:
+            scale = 0.57
+
+        out_path = (self.workdir / outname).resolve()
+        realized = self._run_cmd(
+            arguments=[
+                "solvate",
+                "-box", str(lx), str(ly), str(lz),
+                "-cs", str(solvent_gro),
+                "-scale", str(scale),
+                "-maxsol", str(nmol),
+            ],
+            output_files={"-o": str(out_path)},
+        )
+
+        produced = realized["-o"]
+        nmol_actual = _count_residues_in_gro(produced, solvent_resname)
+        return StepOutput(
+            name="solvent_box",
+            files={"gro": produced},
+            meta={"box": (lx, ly, lz), "scale": float(scale), "nmol_target": int(nmol), "nmol_actual": nmol_actual},
         )
 
     def grompp_em_step(
         self,
+        *,
         gro: str,
         top: str,
         mdp: str,
         out_tpr: str = "em.tpr",
     ) -> StepOutput:
-        """
-        Example: pre-process for energy minimization.
-        Requires: structure (.gro), topology (.top/.itp included), and an EM .mdp.
-        """
+        """Preprocess for energy minimization."""
         out_tpr_path = (self.workdir / out_tpr).resolve()
         realized = self._run_cmd(
             arguments=["grompp"],
-            input_files={
-                "-f": str(mdp),
-                "-c": str(gro),
-                "-p": str(top),
-            },
+            input_files={"-f": str(mdp), "-c": str(gro), "-p": str(top)},
             output_files={"-o": str(out_tpr_path)},
         )
-        return StepOutput(
-            name="grompp_em",
-            files={"tpr": realized["-o"]},
-            meta={},
-        )
+        return StepOutput(name="grompp_em", files={"tpr": realized["-o"]})
 
     def mdrun_em_step(
         self,
+        *,
         tpr: str,
         deffnm: str = "em",
     ) -> StepOutput:
-        """
-        Example: run energy minimization (mdrun).
-        Produces em.gro, em.edr, em.log, em.trr (names hidden behind deffnm).
-        """
-        # With gmxapi, you can either pass explicit outputs or rely on -deffnm.
-        # Here we use -deffnm to keep the file family consistent.
+        """Run energy minimization with mdrun (-deffnm em)."""
         realized = self._run_cmd(
             arguments=["mdrun", "-deffnm", deffnm],
             input_files={"-s": str(tpr)},
             output_files={
-                # Ask gmxapi to track primary outputs you care about:
                 "-c": str((self.workdir / f"{deffnm}.gro").resolve()),
                 "-e": str((self.workdir / f"{deffnm}.edr").resolve()),
                 "-g": str((self.workdir / f"{deffnm}.log").resolve()),
                 "-o": str((self.workdir / f"{deffnm}.trr").resolve()),
             },
         )
-        # Normalize keys for consumers
         return StepOutput(
             name="mdrun_em",
-            files={
-                "gro": realized.get("-c"),
-                "edr": realized.get("-e"),
-                "log": realized.get("-g"),
-                "trr": realized.get("-o"),
-            },
+            files={"gro": realized.get("-c"), "edr": realized.get("-e"), "log": realized.get("-g"), "trr": realized.get("-o")},
             meta={"deffnm": deffnm},
         )
 
-    # ---------- Orchestrator ----------
+    def grompp_nvt_step(
+        self,
+        *,
+        gro: str,
+        top: str,
+        mdp: str,
+        out_tpr: str = "nvt.tpr",
+    ) -> StepOutput:
+        """Preprocess for short NVT equilibration."""
+        out_tpr_path = (self.workdir / out_tpr).resolve()
+        realized = self._run_cmd(
+            arguments=["grompp"],
+            input_files={"-f": str(mdp), "-c": str(gro), "-p": str(top)},
+            output_files={"-o": str(out_tpr_path)},
+        )
+        return StepOutput(name="grompp_nvt", files={"tpr": realized["-o"]})
+
+    def mdrun_nvt_step(
+        self,
+        *,
+        tpr: str,
+        deffnm: str = "nvt",
+    ) -> StepOutput:
+        """Run short NVT equilibration with mdrun (-deffnm nvt)."""
+        realized = self._run_cmd(
+            arguments=["mdrun", "-deffnm", deffnm],
+            input_files={"-s": str(tpr)},
+            output_files={
+                "-c": str((self.workdir / f"{deffnm}.gro").resolve()),
+                "-e": str((self.workdir / f"{deffnm}.edr").resolve()),
+                "-g": str((self.workdir / f"{deffnm}.log").resolve()),
+                "-o": str((self.workdir / f"{deffnm}.trr").resolve()),
+            },
+        )
+        return StepOutput(
+            name="mdrun_nvt",
+            files={"gro": realized.get("-c"), "edr": realized.get("-e"), "log": realized.get("-g"), "trr": realized.get("-o")},
+            meta={"deffnm": deffnm},
+        )
+
+    def combine_solvate_step(
+        self,
+        *,
+        solute_gro: str,             # boxed solute
+        solvent_gro: str,            # (equilibrated) pure solvent box
+        outname: str = "solvated.gro",
+        scale: Optional[float] = None,
+    ) -> StepOutput:
+        """
+        Combine solute + solvent using `gmx solvate -cp solute -cs solvent [-scale S]`.
+        """
+        if scale is None and self.args is not None:
+            scale = getattr(self.args, "scale", None)
+        if scale is None:
+            scale = 0.57
+
+        out_path = (self.workdir / outname).resolve()
+        realized = self._run_cmd(
+            arguments=["solvate", "-cp", str(solute_gro), "-cs", str(solvent_gro), "-scale", str(scale)],
+            output_files={"-o": str(out_path)},
+        )
+        return StepOutput(
+            name="combine_solvate",
+            files={"gro": realized["-o"]},
+            meta={"scale": float(scale)},
+        )
+
+    # ── orchestrator ───────────────────────────────────────────────────────────
 
     def orchestrate(
         self,
@@ -184,21 +349,9 @@ class GmxAPI:
         strict: bool = True,
     ) -> Dict[str, StepOutput]:
         """
-        Run a sequence of registered steps, passing outputs forward.
-
-        Parameters
-        ----------
-        steps : list of step names in execution order.
-        inputs : dict of initial inputs (e.g., {"input_pdb": "...", "top": "...", "mdp": "..."})
-        overrides : optional per-step kwargs to override defaults
-                    e.g., { "create_box": {"box": (10,10,12)}, "mdrun_em": {"deffnm": "min"} }
-        strict : if True, raise on unknown step; else skip with warning.
-
-        Returns
-        -------
-        dict : step name -> StepOutput
+        Execute named steps in order. Promotes common outputs into context for downstream steps.
         """
-        ctx: Dict[str, Any] = dict(inputs)  # working context (files + params)
+        ctx: Dict[str, Any] = dict(inputs)
         results: Dict[str, StepOutput] = {}
         overrides = overrides or {}
 
@@ -207,34 +360,27 @@ class GmxAPI:
             if fn is None:
                 if strict:
                     raise KeyError(f"Unknown step: {name}")
-                else:
-                    print(f"[WARN] Skipping unknown step: {name}")
-                    continue
+                print(f"[WARN] Skipping unknown step: {name}")
+                continue
 
-            # Build call kwargs from ctx + specific overrides
-            kw = {}
-            # Naive but effective: pass only kwargs that the step likely uses
-            # You can keep it simple and rely on Python to raise if missing.
-            kw.update(ctx)
-            kw.update(overrides.get(name, {}))
-
-            # Run
-            out = fn(**kw)  # type: ignore[arg-type]
+            # Merge context + per-step overrides and call the step
+            kwargs = {**ctx, **overrides.get(name, {})}
+            out: StepOutput = fn(**kwargs)  # type: ignore[misc]
             results[name] = out
 
-            # Promote produced files into ctx using predictable keys
-            # so downstream steps can reference them easily.
-            # Example conventions:
+            # Promote canonical outputs into ctx for typical chains
             if name == "create_box":
+                ctx["solute_box_gro"] = out.files["gro"]
                 ctx["gro"] = out.files["gro"]
-            elif name == "grompp_em":
-                ctx["tpr"] = out.files["tpr"]
-            elif name == "mdrun_em":
-                # new minimized structure:
+            elif name == "solvent_box":
+                ctx["gro"] = out.files["gro"]
+            elif name in ("mdrun_em", "mdrun_nvt"):
                 if out.files.get("gro"):
                     ctx["gro"] = out.files["gro"]
+            elif name == "combine_solvate":
+                ctx["gro"] = out.files["gro"]
 
-            # You can also inject `meta` if downstream needs them
-            ctx.update({f"{name}__meta": out.meta})
+            # Stash metadata (optional)
+            ctx[f"{name}__meta"] = out.meta
 
         return results
