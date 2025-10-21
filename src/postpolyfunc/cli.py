@@ -22,6 +22,11 @@ def build_parser() -> argparse.ArgumentParser:
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--solvent", type=Path, help="Solvent structure file.")
     group.add_argument("--solvent-smiles", type=str, help="Solvent SMILES string.")
+    group.add_argument("--box", type=float, nargs=3, metavar=("X","Y","Z"),
+                    help="Box dimensions in nm for the solute (e.g., --box 10 10 12).")
+    group.add_argument("--gmx", default="gmx_mpi", choices=["gmx_mpi","gmx"],
+                    help="Which GROMACS frontend to use.")
+    group.add_argument("solv_number", nargs="?", type=int, help="Number of solvent molecules to add.")
     p.add_argument("--outdir", type=Path, default=Path("outputs"), help="Output directory.")
 
     # --- Functionalization options ---
