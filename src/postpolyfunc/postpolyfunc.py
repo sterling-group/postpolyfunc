@@ -69,13 +69,14 @@ def run_functionalization(solute_path: Path, outdir: Path, ratio: float, seed: i
 def run_workflow(args) -> int:
     """
     Functionalization → LigParGen (solute + solvent) → box creation → solvation →
-    topology preparation.  Stops before minimization or MD.
+    topology prep → EM (grompp + mdrun).
     """
-    
+    from pathlib import Path
+
     outdir = Path(args.outdir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # 1️⃣ Functionalize polymer (keep exactly as you requested)
+    # 1) Functionalize polymer
     func_path = run_functionalization(
         solute_path=args.solute,
         outdir=outdir,
@@ -89,7 +90,7 @@ def run_workflow(args) -> int:
         print("[INFO] LigParGen skipped.")
         return 0
 
-    # 2️⃣ LigParGen for solute
+    # 2) LigParGen: solute
     print("[INFO] Running LigParGen for functionalized solute...")
     solute_artifacts = generate_parameters(
         workdir=outdir,
@@ -102,7 +103,7 @@ def run_workflow(args) -> int:
         executable=args.lp_exe,
     )
 
-    # 3️⃣ LigParGen for solvent
+    # 3) LigParGen: solvent
     print("[INFO] Running LigParGen for solvent...")
     solvent_artifacts = generate_parameters(
         workdir=outdir,
@@ -115,23 +116,35 @@ def run_workflow(args) -> int:
         executable=args.lp_exe,
     )
 
-    outdir = Path(args.outdir).expanduser().resolve()
-    keep_only_root_gmx(outdir)  
-    gmx = GmxAPI(workdir=str(outdir), executable=args.gmx)
-    gmx.args = args  # so create_boxed_structure_step can read --box if provided
+    keep_only_root_gmx(outdir)
 
+    gmx = GmxAPI(workdir=str(outdir), executable=args.gmx)
+    gmx.args = args  # for create_box to read --box if provided
+
+    # ✅ Include em_mdp (and nvt_mdp for later) in inputs
     inputs = {
         "input_pdb": func_path,
-        # no nmol/scale here; they’re for the solvent step only
+        "em_mdp": Path(args.em_mdp),
+        "nvt_mdp": Path(args.nvt_mdp),
+        # Seed defaults; later steps promote ctx["gro"] and ctx["topol_top"]
     }
 
-    topol = gmx.ensure_topol_top(path=outdir / "topol.top")   # ← create skeleton if missing
+    topol = gmx.ensure_topol_top(path=outdir / "topol.top")
 
     overrides = {
-        "create_box":   {"outname": "solute_boxed.gro"},
-        "solvent_box":  {"outname": "solvent_box.gro", "nmol": args.nsolv, "scale": getattr(args, "scale", 0.33),
-                        "box": tuple(args.box) if getattr(args, "box", None) else None},
-        "solvate":      {"outname": "solvated.gro", "topol_top": topol},  # now it exists
+        "create_box": {
+            "outname": "solute_boxed.gro",
+        },
+        "solvent_box": {
+            "outname": "solvent_box.gro",
+            "nmol": args.nsolv,
+            "scale": getattr(args, "scale", 0.33),
+            "box": tuple(args.box) if getattr(args, "box", None) else None,
+        },
+        "solvate": {
+            "outname": "solvated.gro",
+            "topol_top": topol,  # exists now
+        },
         "prepare_topology": {
             "solvent_itp": outdir / "solvent.gmx.itp",
             "solute_itp":  outdir / "solute.gmx.itp",
@@ -140,18 +153,34 @@ def run_workflow(args) -> int:
             "solvent_outname": "solvent.itp",
             "solute_outname":  "solute.itp",
         },
+        # Optional: customize EM outputs
+        "grompp_em": {
+            "out_tpr": outdir / "min.tpr",
+            "mdout_mdp": outdir / "mdout.mdp",
+            "maxwarn": 1,
+        },
+        # Optional: MPI knobs for the run step
+        "mdrun_em": {
+            "tpr": outdir / "min.tpr",
+            "deffnm": "min",
+            "np": 8,
+            "ntomp": 2,
+            "extra_args": ["-pin", "on"],
+        },
     }
 
-
     results = gmx.orchestrate(
-        steps=["create_box", 
-               "solvent_box", 
-               "solvate", 
-               "prepare_topology",
-               "normalize_resnames",
-               "normalize_atomnames",
-                "normalize_topol"
-               ],
+        steps=[
+            "create_box",
+            "solvent_box",
+            "solvate",
+            "prepare_topology",
+            "normalize_resnames",
+            "normalize_atomnames",
+            "normalize_topol",
+            "grompp_em",   # needs: em_mdp, gro, topol_top
+            "mdrun_em",    # 🔁 use this key so promotions work
+        ],
         inputs=inputs,
         overrides=overrides,
     )
@@ -162,10 +191,17 @@ def run_workflow(args) -> int:
     print(f"  Combined system: {results['solvate'].files['gro']}")
     print(f"  Forcefield:      {results['prepare_topology'].files['forcefield_itp']}")
     print(f"  Solvent itp:     {results['prepare_topology'].files['solvent_itp']}")
-    print(f"  Solute itp:      {results['prepare_topology'].files['solute_itp']}")
+    print(f"  Solute  itp:     {results['prepare_topology'].files['solute_itp']}")
     print(f"  Updated topol:   {results['prepare_topology'].files['topol_top']}")
-    print("[INFO] Workflow complete (stopped before minimization).")
+    if "grompp_em" in results:
+        print(f"  EM TPR:          {results['grompp_em'].files['tpr']}")
+    if "mdrun_em" in results:
+        gro_out = results["mdrun_em"].files.get("gro")
+        if gro_out:
+            print(f"  Minimized GRO:   {gro_out}")
+        print(f"  EM log:          {results['mdrun_em'].files.get('log', 'N/A')}")
 
-
+    print("[INFO] Workflow complete (minimization finished).")
     return 0
+
         
