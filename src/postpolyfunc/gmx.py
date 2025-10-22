@@ -11,6 +11,8 @@ import time
 import shlex
 import subprocess
 import inspect
+import re
+from types import SimpleNamespace
 
 
 # ──────────────────────────
@@ -56,6 +58,10 @@ class GmxAPI:
             "solvate": self.solvate_step,              # combine solute + solvent boxes (solvate)
             "combine_solvate": self.combine_solvate_step,    # combine solute + solvent boxes (solvate) 
             "prepare_topology": self.prepare_topology_step,  # combine topology files from LigParGen outputs
+            "normalize_resnames": self.normalize_resnames_step,  # fix .gro resnames to match .itp names  
+            "normalize_atomnames": self.normalize_atomnames_step,   #fix .atom names to match .itp names
+            "normalize_topol": self.normalize_topol_step,      # fix topol.top to match .itp and .gro names
+
         }
 #TODO "grompp_em": self.grompp_em_step,                # EM preproc
             # "mdrun_em": self.mdrun_em_step,                  # EM run
@@ -125,15 +131,75 @@ class GmxAPI:
         p.write_text(
             '; auto-generated skeleton\n'
             '#include "./toppar/forcefield.itp"\n'
-            '#include "./toppar/dcb.itp"\n'
-            '#include "./toppar/c6.itp"\n\n'
+            '#include "./toppar/solvent.itp"\n'
+            '#include "./toppar/solute.itp"\n\n'
             '[ system ]\n'
             f'{system_name}\n\n'
             '[ molecules ]\n'
             '; name  number\n'
         )
         return p
+   
+        """
+        Rewrite the resname (columns 6–10) of every atom line in a .gro file to target_resname.
+        Keeps fixed-width formatting per GROMACS convention.
+        """
+        lines = gro_path.read_text().splitlines()
+        if len(lines) < 3:
+            raise ValueError(f"Not a valid .gro: {gro_path}")
 
+        title = lines[0]
+        natoms = int(lines[1].strip())
+        atom_lines = lines[2:2+natoms]
+        box_line = lines[2+natoms] if len(lines) >= 3+natoms else ""
+
+        tname = (target_resname[:5]).ljust(5)  # GRO resname is width 5
+
+        fixed = []
+        for L in atom_lines:
+            # GRO atom line canonical layout:
+            # %5d %-5s %5s %5d %8.3f %8.3f %8.3f (plus optional v fields)
+            # We’ll parse minimally and rebuild the left part with fixed widths,
+            # then append any trailing coords/velocities as-is.
+            if len(L) < 20:
+                fixed.append(L)  # leave weird lines untouched
+                continue
+            resid   = L[0:5]
+            resname = L[5:10]
+            atom    = L[10:15]
+            atomnr  = L[15:20]
+            rest    = L[20:]  # includes coords (and velocities if present)
+
+            # normalize resid and atomnr spacing
+            resid_s  = f"{int(resid):5d}" if resid.strip().isdigit() else resid
+            atomnr_s = f"{int(atomnr):5d}" if atomnr.strip().isdigit() else atomnr
+
+            newL = f"{resid_s}{tname}{atom}{atomnr_s}{rest}"
+            fixed.append(newL)
+
+        out = [title, f"{natoms}"] + fixed + [box_line]
+        gro_path.write_text("\n".join(out) + "\n")
+
+    def normalize_resnames_to_itp(solute_gro: str | Path,
+                                solvent_gro: str | Path,
+                                solute_itp_out: str | Path,
+                                solvent_itp_out: str | Path) -> tuple[str, str]:
+        """
+        Make .gro residue names match the [ moleculetype ] names in the given .itp files.
+        Returns (solute_name, solvent_name).
+        """
+        solute_gro   = Path(solute_gro)
+        solvent_gro  = Path(solvent_gro)
+        solute_itp   = Path(solute_itp_out)
+        solvent_itp  = Path(solvent_itp_out)
+
+        solute_name  = _read_moleculetype_name(solute_itp)
+        solvent_name = _read_moleculetype_name(solvent_itp)
+
+        _rewrite_gro_resname(solute_gro, solute_name)
+        _rewrite_gro_resname(solvent_gro, solvent_name)
+
+        return solute_name, solvent_name
 
     def solvent_box_step(
     self,
@@ -239,7 +305,7 @@ class GmxAPI:
     *,
     solute_boxed_gro: str | Path = "solute_boxed.gro",
     solvent_box_gro: str | Path = "solvent_box.gro",
-    outname: str = "combined_test.gro",
+    outname: str = "solvated_polymer.gro",
     solvent_resname: str = "SOL",
     topol_top: str | Path | None = None,  # optional: let GROMACS update [molecules]
 ) -> StepOutput:
@@ -479,8 +545,7 @@ class GmxAPI:
     outname: str = "solvated.gro",
     scale: float = 0.57,
 ) -> StepOutput:
-        from pathlib import Path
-        import gmxapi as gmx
+        
 
         solute_gro = str(Path(solute_gro).expanduser().resolve())
         solvent_gro = str(Path(solvent_gro).expanduser().resolve())
@@ -505,28 +570,28 @@ class GmxAPI:
     # Combine topology files from LigParGen outputs
     
     def prepare_topology_step(
-        self,
-        *,
-        solvent_itp: str | Path = "solvent.gmx.itp",
-        solute_itp: str | Path = "solute.gmx.itp",
-        topol_top: str | Path = "topol.top",
-        outdir: str | Path = "toppar",
-        solvent_outname: str = "dcb.itp",
-        solute_outname: str = "c6.itp",
-    ) -> StepOutput:
+    self,
+    *,
+    solvent_itp: str | Path = "solvent.gmx.itp",
+    solute_itp: str | Path = "solute.gmx.itp",
+    topol_top: str | Path = "topol.top",
+    outdir: str | Path = "toppar",
+    solvent_outname: str = "solvent.itp",
+    solute_outname: str = "solute.itp",
+):
         """
-        Consolidate atomtypes into toppar/forcefield.itp, suffix solvent types with 's'
-        and solute (polymer) types with 'p', rewrite [ atoms ] in both .itp files to
-        use the suffixed types, and ensure #includes exist in topol.top.
+        Build toppar/forcefield.itp with [ defaults ] (once) and two [ atomtypes ] blocks
+        (solute 'p' then solvent 's'). Rewrite per-molecule ITPs to remove both [ atomtypes ]
+        and [ defaults ], and suffix opls_#### types in their [ atoms ] sections.
+        Ensures #include lines in topol.top.
 
-        Outputs:
-        toppar/forcefield.itp
-        toppar/dcb.itp
-        toppar/c6.itp
+        Returns an object with .files and .log.
         """
         import re
         from pathlib import Path
+        from types import SimpleNamespace
 
+        # --- setup paths ---
         workdir = Path(self.workdir).expanduser().resolve()
         outdir = (workdir / outdir).resolve()
         outdir.mkdir(parents=True, exist_ok=True)
@@ -542,6 +607,7 @@ class GmxAPI:
         if not topol_top.exists():
             raise FileNotFoundError(f"topol.top not found: {topol_top}")
 
+        # --- regex helpers ---
         SECTION_RE = re.compile(r'^\s*\[([^\]]+)\]\s*(?:;.*)?$')
         COMMENT_RE = re.compile(r';.*$')
 
@@ -564,25 +630,11 @@ class GmxAPI:
             return bool(s) and not s.startswith(';') and not s.startswith('#')
 
         def rename_opls_token(token: str, suffix: str) -> str:
-            # only rename opls_### tokens
+            # only rename tokens that look exactly like opls_###
             return re.sub(r'^(opls_\d+)$', rf'\1{suffix}', token)
 
-        def reatomtype_line(line: str, suffix: str) -> str:
-            stripped = COMMENT_RE.sub('', line).strip()
-            if not stripped:
-                return line
-            parts = stripped.split()
-            if not parts:
-                return line
-            parts[0] = rename_opls_token(parts[0], suffix)
-            cm = COMMENT_RE.search(line)
-            comment = (' ' + cm.group(0)) if cm else ''
-            return (' '.join(parts) + comment).rstrip()
-
-        def parse_atomtypes_block(lines: list[str]) -> list[str]:
-            return [ln for ln in lines if is_data_line(ln)]
-
         def rewrite_atoms_section(lines: list[str], suffix: str) -> list[str]:
+            """Suffix TYPE (2nd field) if it matches opls_###."""
             out: list[str] = []
             for ln in lines:
                 if not is_data_line(ln):
@@ -594,10 +646,9 @@ class GmxAPI:
                     comment = m.group(0)
                     pre = ln[:m.start()]
                 toks = pre.split()
-                # [ atoms ]: nr  type  resnr  resid  atom  cgnr  charge  mass ...
                 if len(toks) >= 2:
                     toks[1] = rename_opls_token(toks[1], suffix)
-                    new_line = "{:<6} {:<16} {}".format(toks[0], toks[1], " ".join(toks[2:])).rstrip()
+                    new_line = " ".join(toks).rstrip()
                     if comment:
                         new_line += " " + comment
                     out.append(new_line)
@@ -605,98 +656,530 @@ class GmxAPI:
                     out.append(ln)
             return out
 
-        def write_itp(dest: Path, sections: dict[str, list[str]]):
-            # include common sections (order isn’t critical, but keep it tidy)
-            order = [
-                'moleculetype','atoms','bonds','pairs','angles','dihedrals','constraints',
-                'exclusions','virtual_sites2','virtual_sites3','virtual_sites4','settles',
-                'system','molecules','atomtypes','nonbond_params','bondtypes','angletypes',
-                'dihedraltypes','constrainttypes'
+        def collect_atomtypes(itp_text: str, suffix: str) -> list[str]:
+            """Get [ atomtypes ] lines, suffix name if opls_###, keep comments, sort by opls number."""
+            sections = split_sections(itp_text)
+            lines = sections.get('atomtypes', [])
+            out = []
+            for ln in lines:
+                if not is_data_line(ln):
+                    continue
+                cm = COMMENT_RE.search(ln)
+                comment = cm.group(0) if cm else ""
+                core = ln if not cm else ln[:cm.start()]
+                toks = core.split()
+                if len(toks) < 7:
+                    continue
+                toks[0] = rename_opls_token(toks[0], suffix)
+                newline = "  " + " ".join(toks)
+                if comment:
+                    newline += " " + comment
+                out.append(newline.strip())
+
+            def opls_num(line: str) -> int:
+                m = re.search(r'opls_(\d+)', line)
+                return int(m.group(1)) if m else 0
+
+            out.sort(key=opls_num)
+            return out
+
+        def collect_defaults(itp_text: str) -> list[str]:
+            """Return the [ defaults ] data+comment lines (no blank-only lines)."""
+            sections = split_sections(itp_text)
+            lines = sections.get('defaults', [])
+            out = []
+            for ln in lines:
+                if ln.strip() == "":
+                    continue
+                out.append(ln.rstrip())
+            return out
+
+        def rewrite_itp_without_ff_sections(itp_text: str, suffix: str) -> str:
+            """
+            Remove [ atomtypes ] and [ defaults ] sections entirely.
+            Rewrite [ atoms ] types with suffix. Leave others unchanged.
+            """
+            sections = split_sections(itp_text)
+            out_lines: list[str] = []
+            for sec_name, sec_lines in sections.items():
+                if sec_name in ('atomtypes', 'defaults'):
+                    continue  # drop; consolidated into forcefield.itp
+                out_lines.append(f"[ {sec_name} ]")
+                if sec_name == 'atoms':
+                    out_lines.extend(rewrite_atoms_section(sec_lines, suffix))
+                else:
+                    out_lines.extend(sec_lines)
+                out_lines.append("")  # blank after section
+            return "\n".join(out_lines).rstrip() + "\n"
+
+        def ensure_includes(top_path: Path, inc_paths: list[Path]) -> None:
+            """Ensure #include lines (paths relative to topol.top folder) exist."""
+            txt = top_path.read_text()
+            rels = [str(p.relative_to(top_path.parent)) for p in inc_paths]
+            missing = [r for r in rels if r not in txt]
+            if not missing:
+                return
+            lines = txt.splitlines()
+            insert_idx = 0
+            for i, L in enumerate(lines):
+                if L.strip().startswith("#include"):
+                    insert_idx = i + 1
+            new_lines = lines[:insert_idx] + [f'#include "{r}"' for r in missing] + lines[insert_idx:]
+            top_path.write_text("\n".join(new_lines) + ("\n" if not txt.endswith("\n") else ""))
+
+        # --- read inputs ---
+        solvent_txt = solvent_itp.read_text()
+        solute_txt  = solute_itp.read_text()
+
+        # --- gather [ defaults ] once for forcefield.itp ---
+        defaults_solute  = collect_defaults(solute_txt)
+        defaults_solvent = collect_defaults(solvent_txt)
+        if defaults_solute and defaults_solvent and defaults_solute != defaults_solvent:
+            defaults_block = defaults_solute  # policy: prefer solute if they differ
+        elif defaults_solute:
+            defaults_block = defaults_solute
+        elif defaults_solvent:
+            defaults_block = defaults_solvent
+        else:
+            defaults_block = [
+                "; nbfunc  comb-rule  gen-pairs  fudgeLJ  fudgeQQ",
+                "  1       3          yes        0.5       0.5",
             ]
-            with dest.open('w') as fh:
-                for name in order:
-                    if name in sections and sections[name]:
-                        fh.write(f"[ {name} ]\n")
-                        for ln in sections[name]:
-                            fh.write(ln.rstrip() + "\n")
-                        fh.write("\n")
 
-        # Load & split
-        solv_sec = split_sections(solvent_itp.read_text())
-        sol_sec  = split_sections(solute_itp.read_text())
-        if 'atomtypes' not in solv_sec or 'atomtypes' not in sol_sec:
-            raise RuntimeError("Both solvent and solute ITPs must contain an [ atomtypes ] section.")
+        # --- gather atomtypes for both, with suffixes ---
+        atomtypes_s = collect_atomtypes(solvent_txt, 's')
+        atomtypes_p = collect_atomtypes(solute_txt,  'p')
 
-        # Build forcefield.itp (defaults + suffixed atomtypes)
-        solv_atomtypes = [reatomtype_line(ln, 's') for ln in parse_atomtypes_block(solv_sec['atomtypes'])]
-        sol_atomtypes  = [reatomtype_line(ln, 'p') for ln in parse_atomtypes_block(sol_sec['atomtypes'])]
+        # --- write toppar/forcefield.itp ---
+        ff_path = outdir / "forcefield.itp"
+        with ff_path.open("w") as fh:
+            fh.write("[ defaults ]\n")
+            for l in defaults_block:
+                fh.write(l.rstrip() + "\n")
+            fh.write("\n[ atomtypes ]\n")
+            for l in atomtypes_p:
+                fh.write(l + "\n")
+            fh.write("\n[ atomtypes ]\n")
+            for l in atomtypes_s:
+                fh.write(l + "\n")
 
-        forcefield_txt = (
-            "[ defaults ]\n"
-            "; nbfunc  comb-rule  gen-pairs  fudgeLJ  fudgeQQ\n"
-            "1         3          yes        0.5      0.5\n\n"
-            "[ atomtypes ]\n" +
-            "\n".join(solv_atomtypes) + "\n\n" +
-            "\n".join(sol_atomtypes)  + "\n"
-        )
-        (outdir / "forcefield.itp").write_text(forcefield_txt)
-
-        # Rewrite [ atoms ] in both itps to match suffixed types
-        solv_mod = dict(solv_sec)
-        if 'atoms' in solv_mod and solv_mod['atoms']:
-            solv_mod['atoms'] = rewrite_atoms_section(solv_mod['atoms'], 's')
-        sol_mod = dict(sol_sec)
-        if 'atoms' in sol_mod and sol_mod['atoms']:
-            sol_mod['atoms'] = rewrite_atoms_section(sol_mod['atoms'], 'p')
-
-        # Write updated ITPs with requested names
+        # --- write cleaned per-molecule ITPs (no defaults, no atomtypes) ---
         solvent_out = outdir / solvent_outname
         solute_out  = outdir / solute_outname
-        write_itp(solvent_out, solv_mod)
-        write_itp(solute_out,  sol_mod)
+        solvent_out.write_text(rewrite_itp_without_ff_sections(solvent_txt, 's'))
+        solute_out.write_text(rewrite_itp_without_ff_sections(solute_txt,  'p'))
 
-        # Ensure #includes in topol.top (idempotent)
-        include_lines = [
-            '#include "./toppar/forcefield.itp"',
-            f'#include "./toppar/{solvent_outname}"',
-            f'#include "./toppar/{solute_outname}"',
-        ]
-        top_txt = topol_top.read_text()
-        missing = [L for L in include_lines if L not in top_txt]
-        if missing:
-            lines = top_txt.splitlines()
-            insertion_idx = None
-            for i, ln in enumerate(lines):
-                s = ln.strip().lower()
-                if s.startswith("[ system ]") or s.startswith("[ molecules ]"):
-                    insertion_idx = i
-                    break
-            if insertion_idx is None:
-                new_txt = top_txt.rstrip() + "\n\n" + "\n".join(include_lines) + "\n"
-            else:
-                new_txt = "\n".join(lines[:insertion_idx] + include_lines + [""] + lines[insertion_idx:])
-            topol_top.write_text(new_txt)
+        # --- ensure #includes in topol.top ---
+        ensure_includes(topol_top, [ff_path, solvent_out, solute_out])
 
-        return StepOutput(
-            name="prepare_topology",
-            files={
-                "forcefield_itp": str((outdir / "forcefield.itp").resolve()),
-                "solvent_itp": str(solvent_out.resolve()),
-                "solute_itp":  str(solute_out.resolve()),
-                "topol_top":   str(topol_top.resolve()),
-            },
-            meta={
-                "solvent_suffix": "s",
-                "solute_suffix": "p",
-                "includes_added": bool(missing),
-            },
+        # --- return small object with .files + .log ---
+        files_map = {
+            "forcefield_itp": str(ff_path),
+            "solvent_itp": str(solvent_out),
+            "solute_itp": str(solute_out),
+            "topol_top": str(topol_top),
+        }
+        msg = (
+            "Topology prepared:\n"
+            f" - {ff_path}\n"
+            f" - {solvent_out}\n"
+            f" - {solute_out}\n"
+            f"Including lines ensured in {topol_top}."
         )
+        return SimpleNamespace(files=files_map, log=msg)
+
+    def _read_moleculetype_name(itp_path: Path) -> str:
+        txt = Path(itp_path).read_text()
+        m = re.search(r'^\s*\[\s*moleculetype\s*\]\s*(?:;.*)?$([\s\S]*?)(?=^\s*\[|\Z)', txt, re.MULTILINE)
+        for line in m.group(1).splitlines():
+            s = line.strip()
+            if s and not s.startswith((';', '#')):
+                return s.split()[0]
+        raise ValueError(f"Bad [moleculetype] in {itp_path}")
+
+    def _rewrite_gro_resname(gro_path: Path, target_resname: str, only_if_name_in: set[str] | None = None) -> int:
+        p = Path(gro_path)
+        lines = p.read_text().splitlines()
+        title, natoms = lines[0], int(lines[1].strip())
+        atom_lines = lines[2:2+natoms]
+        box_line   = lines[2+natoms]
+        tname = (target_resname[:5]).ljust(5)
+        changed, fixed = 0, []
+        for L in atom_lines:
+            resid, resname, atom, atomnr, rest = L[0:5], L[5:10], L[10:15], L[15:20], L[20:]
+            cur = resname.strip()
+            if (only_if_name_in is None) or (cur in only_if_name_in):
+                resid_s  = f"{int(resid):5d}" if resid.strip().isdigit() else resid
+                atomnr_s = f"{int(atomnr):5d}" if atomnr.strip().isdigit() else atomnr
+                fixed.append(f"{resid_s}{tname}{atom}{atomnr_s}{rest}")
+                changed += 1
+            else:
+                fixed.append(L)
+        p.write_text("\n".join([title, f"{natoms}", *fixed, box_line]) + "\n")
+        return changed
+   
+    def normalize_resnames_step(
+        self,
+        *,
+        gro: str | Path,
+        solute_itp: str | Path,
+        solvent_itp: str | Path,
+    ):
+        """
+        Normalize the combined GRO’s residue names *in place* to the moleculetype names
+        from the ITPs. Changes only resnames that are generic:
+        MOL  -> <solute moleculetype>
+        SOL/WAT/HOH -> <solvent moleculetype>
+        Returns an object with .files['gro'] so orchestrate can promote it.
+        """
+        import re
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        gro = Path(gro).resolve()
+        solute_itp = Path(solute_itp).resolve()
+        solvent_itp = Path(solvent_itp).resolve()
+
+        def read_mtype(p: Path) -> str:
+            txt = p.read_text()
+            m = re.search(r'^\s*\[\s*moleculetype\s*\]\s*(?:;.*)?$([\s\S]*?)(?=^\s*\[|\Z)', txt, re.MULTILINE)
+            if not m:
+                raise ValueError(f"[moleculetype] not found in {p}")
+            for line in m.group(1).splitlines():
+                s = line.strip()
+                if s and not s.startswith((';', '#')):
+                    return s.split()[0]
+            raise ValueError(f"Empty [moleculetype] in {p}")
+
+        def rewrite_gro_resname(gro_path: Path, target_resname: str, only_if: set[str] | None = None) -> int:
+            lines = gro_path.read_text().splitlines()
+            if len(lines) < 3:
+                raise ValueError(f"Invalid .gro: {gro_path}")
+            title, natoms = lines[0], int(lines[1].strip())
+            atom_lines = lines[2:2+natoms]
+            box_line   = lines[2+natoms] if len(lines) >= 3+natoms else ""
+            tname = (target_resname[:5]).ljust(5)
+
+            changed = 0
+            fixed = []
+            for L in atom_lines:
+                if len(L) < 20:
+                    fixed.append(L); continue
+                resid, resname, atom, atomnr, rest = L[0:5], L[5:10], L[10:15], L[15:20], L[20:]
+                cur = resname.strip()
+                if (only_if is None) or (cur in only_if):
+                    resid_s  = f"{int(resid):5d}" if resid.strip().isdigit() else resid
+                    atomnr_s = f"{int(atomnr):5d}" if atomnr.strip().isdigit() else atomnr
+                    fixed.append(f"{resid_s}{tname}{atom}{atomnr_s}{rest}")
+                    changed += 1
+                else:
+                    fixed.append(L)
+
+            gro_path.write_text("\n".join([title, f"{natoms}", *fixed, box_line]) + "\n")
+            return changed
+
+        solute_name  = read_mtype(solute_itp)
+        solvent_name = read_mtype(solvent_itp)
+        n1 = rewrite_gro_resname(gro, solute_name, only_if={"MOL"})
+        n2 = rewrite_gro_resname(gro, solvent_name, only_if={"SOL", "WAT", "HOH"})
+        msg = f"Normalized {gro.name}: MOL→{solute_name} ({n1}), SOL/WAT→{solvent_name} ({n2})"
+
+        return SimpleNamespace(files={"gro": str(gro)}, log=msg)
+
+    def normalize_atomnames_step(
+        self,
+        *,
+        gro: str | Path,
+        solute_itp: str | Path,
+    ):
+        """
+        Rename the atom-name column in the GRO for the *solute* residue so it matches the
+        atom names from the solute ITP [ atoms ] section (5th column). Operates in place.
+        Assumes a single solute residue (count=1).
+        """
+        import re
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        gro_path = Path(gro).resolve()
+        itp_path = Path(solute_itp).resolve()
+
+        if not gro_path.exists() or not itp_path.exists():
+            msg = f"normalize_atomnames: missing file(s) gro={gro_path.exists()} itp={itp_path.exists()}"
+            print(f"[WARN] {msg}")
+            return SimpleNamespace(files={"gro": str(gro_path)}, log=msg)
+
+        txt = itp_path.read_text()
+
+        # moleculetype name (also your solute resname)
+        mtype_m = re.search(r'^\s*\[\s*moleculetype\s*\]\s*(?:;.*)?$([\s\S]*?)(?=^\s*\[|\Z)', txt, re.MULTILINE)
+        if not mtype_m:
+            msg = f"normalize_atomnames: [moleculetype] not found in {itp_path.name}"
+            print(f"[WARN] {msg}")
+            return SimpleNamespace(files={"gro": str(gro_path)}, log=msg)
+        solute_resname = None
+        for line in mtype_m.group(1).splitlines():
+            s = line.strip()
+            if s and not s.startswith((';', '#')):
+                solute_resname = s.split()[0]
+                break
+        if not solute_resname:
+            msg = f"normalize_atomnames: empty [moleculetype] in {itp_path.name}"
+            print(f"[WARN] {msg}")
+            return SimpleNamespace(files={"gro": str(gro_path)}, log=msg)
+
+        # atom names from [ atoms ] (5th column)
+        atoms_m = re.search(r'^\s*\[\s*atoms\s*\]\s*(?:;.*)?$([\s\S]*?)(?=^\s*\[|\Z)', txt, re.MULTILINE)
+        if not atoms_m:
+            msg = f"normalize_atomnames: [ atoms ] not found in {itp_path.name}"
+            print(f"[WARN] {msg}")
+            return SimpleNamespace(files={"gro": str(gro_path)}, log=msg)
+
+        atom_names = []
+        for line in atoms_m.group(1).splitlines():
+            s = line.strip()
+            if not s or s.startswith((';', '#')):
+                continue
+            toks = s.split()
+            # [ atoms ]: nr type resnr resid atom cgnr charge mass ...
+            if len(toks) >= 5:
+                atom_names.append(toks[4])
+
+        if not atom_names:
+            msg = f"normalize_atomnames: no atom names parsed from [ atoms ] in {itp_path.name}"
+            print(f"[WARN] {msg}")
+            return SimpleNamespace(files={"gro": str(gro_path)}, log=msg)
+
+        # rewrite the GRO atom-name field for the first residue with resname==solute_resname
+        lines = gro_path.read_text().splitlines()
+        if len(lines) < 3:
+            msg = f"normalize_atomnames: invalid GRO {gro_path.name}"
+            print(f"[WARN] {msg}")
+            return SimpleNamespace(files={"gro": str(gro_path)}, log=msg)
+
+        title = lines[0]
+        natoms = int(lines[1].strip())
+        atom_lines = lines[2:2+natoms]
+        box_line = lines[2+natoms] if len(lines) >= 3+natoms else ""
+
+        # Find indices of atoms in the first solute residue block
+        first_idx = None
+        target_resid = None
+        idxs = []
+        for i, L in enumerate(atom_lines):
+            if len(L) < 20:
+                continue
+            resid, resname = L[0:5], L[5:10]
+            rname = resname.strip()
+            if rname == solute_resname:
+                rid = resid.strip()
+                if first_idx is None:
+                    first_idx = i
+                    target_resid = rid  # stick to the first residue number we see
+                if resid.strip() == target_resid:
+                    idxs.append(i)
+                else:
+                    # we reached another residue, stop collecting
+                    break
+
+        if not idxs:
+            msg = f"normalize_atomnames: no atoms with resname '{solute_resname}' found in {gro_path.name}"
+            print(f"[WARN] {msg}")
+            return SimpleNamespace(files={"gro": str(gro_path)}, log=msg)
+
+        if len(idxs) != len(atom_names):
+            msg = (f"normalize_atomnames: solute atom count mismatch "
+                f"(GRO {len(idxs)} vs ITP {len(atom_names)}); skipping rename.")
+            print(f"[WARN] {msg}")
+            return SimpleNamespace(files={"gro": str(gro_path)}, log=msg)
+
+        # Apply renaming (column 10–15 in GRO)
+        fixed = atom_lines[:]  # copy
+        for k, i in enumerate(idxs):
+            L = atom_lines[i]
+            resid, resname, atom, atomnr, rest = L[0:5], L[5:10], L[10:15], L[15:20], L[20:]
+            new_atom = (atom_names[k][:5]).rjust(5)  # atom field is width 5, right-justified
+            fixed[i] = f"{resid}{resname}{new_atom}{atomnr}{rest}"
+
+        out_lines = [title, f"{natoms}", *fixed, box_line]
+        gro_path.write_text("\n".join(out_lines) + "\n")
+
+        msg = f"normalize_atomnames: renamed {len(idxs)} atoms in residue {solute_resname} from GRO to match ITP"
+        print(f"[INFO] {msg}")
+        return SimpleNamespace(files={"gro": str(gro_path)}, log=msg)
+
+    def _read_moleculetype_name(itp_path: Path) -> str:
+        """
+        Return the first data token in [ moleculetype ] from an .itp file.
+        """
+        text = itp_path.read_text()
+        m = re.search(r'^\s*\[\s*moleculetype\s*\]\s*(?:;.*)?$([\s\S]*?)(?=^\s*\[|\Z)',
+                    text, re.MULTILINE)
+        if not m:
+            raise ValueError(f"[moleculetype] not found in {itp_path}")
+        for line in m.group(1).splitlines():
+            s = line.strip()
+            if s and not s.startswith((';', '#')):
+                return s.split()[0]
+        raise ValueError(f"Empty [moleculetype] block in {itp_path}")
+
+    def _count_residues_in_gro(gro_path: Path) -> Dict[str, int]:
+        """
+        Count residues in a .gro by resname. We count a residue whenever the (resid,resname)
+        tuple changes (standard GRO layout).
+        Returns dict: {resname: count}
+        """
+        lines = gro_path.read_text().splitlines()
+        if len(lines) < 3:
+            raise ValueError(f"Invalid .gro: {gro_path}")
+        natoms = int(lines[1].strip())
+        atom_lines = lines[2:2+natoms]
+
+        counts: Dict[str, int] = {}
+        prev_key: Optional[Tuple[str, str]] = None
+        for L in atom_lines:
+            if len(L) < 20:
+                continue
+            resid = L[0:5].strip()
+            resnm = L[5:10].strip()
+            key = (resid, resnm)
+            if key != prev_key:
+                counts[resnm] = counts.get(resnm, 0) + 1
+                prev_key = key
+        return counts
+
+    def _rel_include(from_file: Path, target: Path) -> str:
+        """
+        Return a quoted include path relative to 'from_file' parent.
+        """
+        rel = target.resolve().relative_to(from_file.parent.resolve())
+        return f"#include \"{rel.as_posix()}\""
+
+    def normalize_topol_step(
+    self,
+    *,
+    gro: str | Path,                        # combined, normalized GRO (e.g., solvated.gro)
+    forcefield_itp: str | Path,             # toppar/forcefield.itp
+    solvent_itp: str | Path,                # toppar/dcb.itp (or your solvent)
+    solute_itp: str | Path,                 # toppar/c6.itp (or your solute)
+    topol_top: str | Path = "topol.top",    # output to write (rebuilt)
+    system_title: str = "Polymer in solvent in water",
+    include_others: bool = False,           # set True to append any extra residue types seen in GRO
+):
+        """
+        Rebuild topol.top with:
+        - 3 includes (forcefield, solvent, solute) using paths relative to topol.top
+        - [ system ] title
+        - [ molecules ] with counts taken from GRO resnames (must already be normalized)
+        """
+        import re
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        gro = Path(gro).resolve()
+        forcefield_itp = Path(forcefield_itp).resolve()
+        solvent_itp    = Path(solvent_itp).resolve()
+        solute_itp     = Path(solute_itp).resolve()
+        topol_top      = Path(topol_top).resolve()
+
+        if not gro.exists():
+            raise FileNotFoundError(f"GRO not found: {gro}")
+        for p in (forcefield_itp, solvent_itp, solute_itp):
+            if not p.exists():
+                raise FileNotFoundError(f"ITP not found: {p}")
+
+        def read_moleculetype_name(itp_path: Path) -> str:
+            txt = itp_path.read_text()
+            m = re.search(r'^\s*\[\s*moleculetype\s*\]\s*(?:;.*)?$([\s\S]*?)(?=^\s*\[|\Z)', txt, re.MULTILINE)
+            if not m:
+                raise ValueError(f"[moleculetype] not found in {itp_path}")
+            for line in m.group(1).splitlines():
+                s = line.strip()
+                if s and not s.startswith((';', '#')):
+                    return s.split()[0]
+            raise ValueError(f"Empty [moleculetype] block in {itp_path}")
+
+        def count_residues_in_gro(gro_path: Path) -> dict[str, int]:
+            lines = gro_path.read_text().splitlines()
+            if len(lines) < 3:
+                raise ValueError(f"Invalid .gro: {gro_path}")
+            natoms = int(lines[1].strip())
+            atom_lines = lines[2:2+natoms]
+            counts: dict[str, int] = {}
+            prev_key = None
+            for L in atom_lines:
+                if len(L) < 20:
+                    continue
+                resid = L[0:5].strip()
+                resnm = L[5:10].strip()
+                key = (resid, resnm)
+                if key != prev_key:
+                    counts[resnm] = counts.get(resnm, 0) + 1
+                    prev_key = key
+            return counts
+
+        def rel_include(from_file: Path, target: Path) -> str:
+            rel = target.resolve().relative_to(from_file.parent.resolve())
+            return f'#include "{rel.as_posix()}"'
+
+        # names & counts
+        solute_name  = read_moleculetype_name(solute_itp)
+        solvent_name = read_moleculetype_name(solvent_itp)
+        counts       = count_residues_in_gro(gro)
+        solute_count  = counts.get(solute_name, 0)
+        solvent_count = counts.get(solvent_name, 0)
+
+        # includes relative to topol.top
+        inc_ff  = rel_include(topol_top, forcefield_itp)
+        inc_sol = rel_include(topol_top, solvent_itp)
+        inc_solute = rel_include(topol_top, solute_itp)
+
+        mol_lines = [
+            "; name  number",
+            f"{solute_name:<16} {solute_count}",
+            f"{solvent_name:<16} {solvent_count}",
+        ]
+        if include_others:
+            for rn, n in sorted(counts.items()):
+                if rn not in (solute_name, solvent_name):
+                    mol_lines.append(f"{rn:<16} {n}")
+
+        out_lines = [
+            "; auto-generated skeleton",
+            inc_ff,
+            inc_sol,
+            inc_solute,
+            "",
+            "[ system ]",
+            system_title,
+            "",
+            "[ molecules ]",
+            *mol_lines,
+            "",
+        ]
+        topol_top.parent.mkdir(parents=True, exist_ok=True)
+        topol_top.write_text("\n".join(out_lines))
+
+        others = {rn: n for rn, n in counts.items() if rn not in (solute_name, solvent_name)}
+        msg = (f"normalize_topol: wrote {topol_top.name} with "
+        f"{solute_name}={solute_count}, {solvent_name}={solvent_count}; others={others}")
+
+        print("[INFO] " + msg)
+        return SimpleNamespace(files={"topol_top": str(topol_top), "gro": str(gro)}, log=msg)
 
     # ── orchestrator ───────────────────────────────────────────────────────────
 
     def orchestrate(self, steps, *, inputs, overrides=None, strict=True) -> Dict[str, StepOutput]:
+        """
+        Run the registered steps in order, passing only the parameters each step accepts,
+        and promote key outputs into the shared ctx for downstream steps.
+        No GRO/ITP normalization logic lives here.
+        """
+        import inspect
+        from typing import Dict
+
         ctx = dict(inputs)
-        results = {}
+        results: Dict[str, StepOutput] = {}
         overrides = overrides or {}
 
         for name in steps:
@@ -707,26 +1190,45 @@ class GmxAPI:
                 print(f"[WARN] Skipping unknown step: {name}")
                 continue
 
-            # merge then filter by function signature
+            # Merge inputs with per-step overrides, filter by fn signature
             merged = {**ctx, **overrides.get(name, {})}
             sig = inspect.signature(fn)
             allowed = {k: v for k, v in merged.items() if k in sig.parameters}
 
+            # Run the step
             out: StepOutput = fn(**allowed)  # type: ignore[misc]
             results[name] = out
 
-            # promote outputs (your existing logic)
-            # promote outputs
+            # Promote common outputs for downstream steps
             if name == "create_box":
                 ctx["solute_box_gro"] = out.files["gro"]
                 ctx["gro"] = out.files["gro"]
-            elif name == "solvent_box":                 # <-- match the registry key
+
+            elif name == "solvent_box":
                 ctx["solvent_box_gro"] = out.files["gro"]
                 ctx["gro"] = out.files["gro"]
+
+            elif name == "prepare_topology":
+                # expose paths produced by the topology-prep step
+                ctx["forcefield_itp"] = out.files.get("forcefield_itp")
+                ctx["solvent_itp"]    = out.files.get("solvent_itp")
+                ctx["solute_itp"]     = out.files.get("solute_itp")
+                ctx["topol_top"]      = out.files.get("topol_top")
+                
+            elif name == "normalize_resnames":
+                ctx["gro"] = out.files["gro"]    # ensure EM/NVT read the normalized GRO
+
+            elif name == "normalize_atomnames":
+                ctx["gro"] = out.files["gro"]        
             elif name in ("combine_solvate", "solvate"):
                 ctx["gro"] = out.files["gro"]
+
             elif name in ("mdrun_em", "mdrun_nvt"):
                 if out.files.get("gro"):
                     ctx["gro"] = out.files["gro"]
-
+            elif name == "normalize_topol":
+                ctx["topol_top"] = out.files["topol_top"]
+                # ctx["gro"] already set earlier; keep as-is
         return results
+
+
