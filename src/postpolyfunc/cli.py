@@ -75,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Target number of solvent molecules for the pure solvent box.")
     p.add_argument("--scale", type=float, default=0.33,
                    help="vdW radii scale for packing (gmx solvate -scale). Default: 0.57.")
-    p.add_argument("--em-mdp", type=Path, required=True,
+    p.add_argument("--em-mdp",dest="em_mdp", type=Path, required=True,
                    help="Path to energy-minimization .mdp file.")
     p.add_argument("--nvt-mdp", type=Path, required=True,
                    help="Path to short NVT equilibration .mdp file.")
