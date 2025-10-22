@@ -10,69 +10,7 @@ import logging
 import time
 import shlex
 import subprocess
-# ──────────────────────────
-# Internal GROMACS helpers
-# ──────────────────────────
-
-def _read_box_xyz_from_gro(gro_path: str) -> tuple[float, float, float]:
-    """
-    Parse box vectors (nm) from last line of a .gro file.
-    For orthorhombic boxes expect 3 floats; for triclinic, we take first 3.
-    """
-    last = Path(gro_path).read_text().strip().splitlines()[-1].split()
-    if len(last) < 3:
-        raise ValueError(f"Could not parse box from {gro_path}")
-    return float(last[0]), float(last[1]), float(last[2])
-
-
-def _count_residues_in_gro(gro_path: str, resname: str) -> int:
-    """
-    Count residues by residue number for a given residue name in a .gro.
-    Assumes classic .gro formatting; uses columns [0:5]=resnr, [5:10]=resname.
-    """
-    with open(gro_path, "r") as f:
-        lines = f.readlines()
-    if len(lines) < 3:
-        return 0
-    natoms = int(lines[1].strip())
-    seen: set[int] = set()
-    for line in lines[2:2 + natoms]:
-        rn = line[5:10].strip()
-        if rn == resname:
-            try:
-                resnr = int(line[:5])
-                seen.add(resnr)
-            except ValueError:
-                # tolerate malformed lines
-                continue
-    return len(seen)
-
-
-def write_merged_topology(
-    out_top: Path,
-    *,
-    forcefield_includes: list[str],
-    solute_itp: Path,
-    solvent_itp: Path,
-    solute_name: str,
-    solvent_name: str,
-    solvated_gro: Path,
-    solvent_resname: str = "SOL",
-    n_solute: int = 1,
-) -> Path:
-    """
-    Minimal, reproducible merged topology that includes both ITPs and writes a [ molecules ] table.
-    Counts solvent molecules directly from the solvated .gro.
-    """
-    ns = _count_residues_in_gro(str(solvated_gro), solvent_resname)
-
-    lines: list[str] = []
-    lines += [*forcefield_includes, ""]
-    lines += [f'#include "{solute_itp.name}"', f'#include "{solvent_itp.name}"', ""]
-    lines += ["[ system ]", "Mixed solute + solvent", ""]
-    lines += ["[ molecules ]", f"{solute_name}    {n_solute}", f"{solvent_name}   {ns}", ""]
-    out_top.write_text("\n".join(lines))
-    return out_top
+import inspect
 
 
 # ──────────────────────────
@@ -115,14 +53,15 @@ class GmxAPI:
         self._registry: Dict[str, Any] = {
             "create_box": self.create_boxed_structure_step,  # solute-only box (editconf)
             "solvent_box": self.solvent_box_step,            # build pure solvent box sized to solute box
-            "solvate_step": self.solvate_step,              # combine solute + solvent boxes (solvate)
-            # "grompp_em": self.grompp_em_step,                # EM preproc
+            "solvate": self.solvate_step,              # combine solute + solvent boxes (solvate)
+            "combine_solvate": self.combine_solvate_step,    # combine solute + solvent boxes (solvate) 
+            "prepare_topology": self.prepare_topology_step,  # combine topology files from LigParGen outputs
+        }
+#TODO "grompp_em": self.grompp_em_step,                # EM preproc
             # "mdrun_em": self.mdrun_em_step,                  # EM run
             # "grompp_nvt": self.grompp_nvt_step,              # NVT preproc
             # "mdrun_nvt": self.mdrun_nvt_step,                # NVT run
             # "combine_solvate": self.combine_solvate_step,    # merge solute + solvent via gmx solvate
-        }
-
     # ── steps ─────────────────────────────────────────────────────────────────
 
     def create_boxed_structure_step(
@@ -178,6 +117,23 @@ class GmxAPI:
             files={"gro": str(target)},
             meta={"box": (float(bx), float(by), float(bz)), "boxtype": boxtype, "center": center},
         )
+
+    def ensure_topol_top(self, *, path: str | Path, system_name: str = "Polymer in solvent") -> Path:
+        p = Path(path).expanduser().resolve()
+        if p.exists():
+            return p
+        p.write_text(
+            '; auto-generated skeleton\n'
+            '#include "./toppar/forcefield.itp"\n'
+            '#include "./toppar/dcb.itp"\n'
+            '#include "./toppar/c6.itp"\n\n'
+            '[ system ]\n'
+            f'{system_name}\n\n'
+            '[ molecules ]\n'
+            '; name  number\n'
+        )
+        return p
+
 
     def solvent_box_step(
     self,
@@ -284,18 +240,12 @@ class GmxAPI:
     solute_boxed_gro: str | Path = "solute_boxed.gro",
     solvent_box_gro: str | Path = "solvent_box.gro",
     outname: str = "combined_test.gro",
-    solvent_resname: str = "SOL",   # used only for counting
+    solvent_resname: str = "SOL",
+    topol_top: str | Path | None = None,  # optional: let GROMACS update [molecules]
 ) -> StepOutput:
-        """
-        Combine a boxed solute with a solvent box using `gmx_mpi solvate`.
-
-        Equivalent CLI:
-        gmx_mpi solvate -cp solute_boxed.gro -cs solvent_box.gro -o combined_test.gro
-        """
         workdir = Path(self.workdir).expanduser().resolve()
         workdir.mkdir(parents=True, exist_ok=True)
 
-        # Resolve inputs under workdir unless absolute paths are given
         solute_gro = Path(solute_boxed_gro)
         if not solute_gro.is_absolute():
             solute_gro = workdir / solute_gro
@@ -309,48 +259,45 @@ class GmxAPI:
         if not solvent_gro.exists():
             raise FileNotFoundError(f"Solvent box not found: {solvent_gro}")
 
-        # Build args (note: DO NOT include '-o' here; gmxapi sets it via output_files)
+        # Build args (ONLY args; DO NOT duplicate with input_files)
         args = [
             "solvate",
             "-cp", str(solute_gro),
             "-cs", str(solvent_gro),
+            
         ]
+        # inside solvate_step, around where you handle topol_top
+        if topol_top is not None:
+            topol_top = Path(topol_top) if Path(topol_top).is_absolute() else workdir / topol_top
+            if topol_top.exists():
+                args += ["-p", str(topol_top)]
+            else:
+                logging.warning(f"topol.top not found at {topol_top}; proceeding without -p so [molecules] won't be auto-updated.")
 
-        logging.info(
-            "Solvating (combine polymer + solvent): %s %s -o %s",
-            self.executable,
-            " ".join(shlex.quote(a) for a in args),
-            shlex.quote(out_path),
-        )
+
+        logging.info("Solvating (combine polymer + solvent): %s %s",
+                    self.executable, " ".join(shlex.quote(a) for a in args))
 
         op = gmx.commandline_operation(
-            executable=self.executable,      # e.g., "gmx_mpi"
+            executable=self.executable,
             arguments=args,
-            input_files={
-                "-cp": str(solute_gro),
-                "-cs": str(solvent_gro),
-            },
-            output_files={"-o": out_path},
+            input_files={},                 # <— IMPORTANT: nothing here to avoid duplicate flags
+            output_files={"-o": out_path},  # ok to keep; alternatively remove "-o" from args above
         )
-
         rc = op.run()
 
         combined = Path(out_path)
         if not combined.exists():
-            try:
-                stdout = op.output.stdout.result()
-            except Exception:
-                stdout = ""
-            try:
-                stderr = op.output.stderr.result()
-            except Exception:
-                stderr = ""
+            try: stdout = op.output.stdout.result()
+            except Exception: stdout = ""
+            try: stderr = op.output.stderr.result()
+            except Exception: stderr = ""
             raise RuntimeError(
                 "gmx solvate failed (no output file created).\n"
                 f"Return code: {rc}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
             )
 
-        # Optional: count solvent molecules (unique residue ids with given resname)
+        # Optional: count solvent molecules
         nmol_solvent = 0
         try:
             with combined.open() as fh:
@@ -555,21 +502,201 @@ class GmxAPI:
             meta={"scale": float(scale)},
         )
 
+    # Combine topology files from LigParGen outputs
+    
+    def prepare_topology_step(
+        self,
+        *,
+        solvent_itp: str | Path = "solvent.gmx.itp",
+        solute_itp: str | Path = "solute.gmx.itp",
+        topol_top: str | Path = "topol.top",
+        outdir: str | Path = "toppar",
+        solvent_outname: str = "dcb.itp",
+        solute_outname: str = "c6.itp",
+    ) -> StepOutput:
+        """
+        Consolidate atomtypes into toppar/forcefield.itp, suffix solvent types with 's'
+        and solute (polymer) types with 'p', rewrite [ atoms ] in both .itp files to
+        use the suffixed types, and ensure #includes exist in topol.top.
+
+        Outputs:
+        toppar/forcefield.itp
+        toppar/dcb.itp
+        toppar/c6.itp
+        """
+        import re
+        from pathlib import Path
+
+        workdir = Path(self.workdir).expanduser().resolve()
+        outdir = (workdir / outdir).resolve()
+        outdir.mkdir(parents=True, exist_ok=True)
+
+        solvent_itp = Path(solvent_itp) if Path(solvent_itp).is_absolute() else workdir / solvent_itp
+        solute_itp  = Path(solute_itp)  if Path(solute_itp).is_absolute()  else workdir / solute_itp
+        topol_top   = Path(topol_top)   if Path(topol_top).is_absolute()   else workdir / topol_top
+
+        if not solvent_itp.exists():
+            raise FileNotFoundError(f"Solvent ITP not found: {solvent_itp}")
+        if not solute_itp.exists():
+            raise FileNotFoundError(f"Solute ITP not found: {solute_itp}")
+        if not topol_top.exists():
+            raise FileNotFoundError(f"topol.top not found: {topol_top}")
+
+        SECTION_RE = re.compile(r'^\s*\[([^\]]+)\]\s*(?:;.*)?$')
+        COMMENT_RE = re.compile(r';.*$')
+
+        def split_sections(text: str) -> dict[str, list[str]]:
+            sections: dict[str, list[str]] = {}
+            current = None
+            for raw in text.splitlines():
+                line = raw.rstrip('\n')
+                m = SECTION_RE.match(line)
+                if m:
+                    current = m.group(1).strip().lower()
+                    sections.setdefault(current, [])
+                else:
+                    if current is not None:
+                        sections[current].append(line)
+            return sections
+
+        def is_data_line(line: str) -> bool:
+            s = line.strip()
+            return bool(s) and not s.startswith(';') and not s.startswith('#')
+
+        def rename_opls_token(token: str, suffix: str) -> str:
+            # only rename opls_### tokens
+            return re.sub(r'^(opls_\d+)$', rf'\1{suffix}', token)
+
+        def reatomtype_line(line: str, suffix: str) -> str:
+            stripped = COMMENT_RE.sub('', line).strip()
+            if not stripped:
+                return line
+            parts = stripped.split()
+            if not parts:
+                return line
+            parts[0] = rename_opls_token(parts[0], suffix)
+            cm = COMMENT_RE.search(line)
+            comment = (' ' + cm.group(0)) if cm else ''
+            return (' '.join(parts) + comment).rstrip()
+
+        def parse_atomtypes_block(lines: list[str]) -> list[str]:
+            return [ln for ln in lines if is_data_line(ln)]
+
+        def rewrite_atoms_section(lines: list[str], suffix: str) -> list[str]:
+            out: list[str] = []
+            for ln in lines:
+                if not is_data_line(ln):
+                    out.append(ln)
+                    continue
+                pre, comment = ln, ""
+                m = COMMENT_RE.search(ln)
+                if m:
+                    comment = m.group(0)
+                    pre = ln[:m.start()]
+                toks = pre.split()
+                # [ atoms ]: nr  type  resnr  resid  atom  cgnr  charge  mass ...
+                if len(toks) >= 2:
+                    toks[1] = rename_opls_token(toks[1], suffix)
+                    new_line = "{:<6} {:<16} {}".format(toks[0], toks[1], " ".join(toks[2:])).rstrip()
+                    if comment:
+                        new_line += " " + comment
+                    out.append(new_line)
+                else:
+                    out.append(ln)
+            return out
+
+        def write_itp(dest: Path, sections: dict[str, list[str]]):
+            # include common sections (order isn’t critical, but keep it tidy)
+            order = [
+                'moleculetype','atoms','bonds','pairs','angles','dihedrals','constraints',
+                'exclusions','virtual_sites2','virtual_sites3','virtual_sites4','settles',
+                'system','molecules','atomtypes','nonbond_params','bondtypes','angletypes',
+                'dihedraltypes','constrainttypes'
+            ]
+            with dest.open('w') as fh:
+                for name in order:
+                    if name in sections and sections[name]:
+                        fh.write(f"[ {name} ]\n")
+                        for ln in sections[name]:
+                            fh.write(ln.rstrip() + "\n")
+                        fh.write("\n")
+
+        # Load & split
+        solv_sec = split_sections(solvent_itp.read_text())
+        sol_sec  = split_sections(solute_itp.read_text())
+        if 'atomtypes' not in solv_sec or 'atomtypes' not in sol_sec:
+            raise RuntimeError("Both solvent and solute ITPs must contain an [ atomtypes ] section.")
+
+        # Build forcefield.itp (defaults + suffixed atomtypes)
+        solv_atomtypes = [reatomtype_line(ln, 's') for ln in parse_atomtypes_block(solv_sec['atomtypes'])]
+        sol_atomtypes  = [reatomtype_line(ln, 'p') for ln in parse_atomtypes_block(sol_sec['atomtypes'])]
+
+        forcefield_txt = (
+            "[ defaults ]\n"
+            "; nbfunc  comb-rule  gen-pairs  fudgeLJ  fudgeQQ\n"
+            "1         3          yes        0.5      0.5\n\n"
+            "[ atomtypes ]\n" +
+            "\n".join(solv_atomtypes) + "\n\n" +
+            "\n".join(sol_atomtypes)  + "\n"
+        )
+        (outdir / "forcefield.itp").write_text(forcefield_txt)
+
+        # Rewrite [ atoms ] in both itps to match suffixed types
+        solv_mod = dict(solv_sec)
+        if 'atoms' in solv_mod and solv_mod['atoms']:
+            solv_mod['atoms'] = rewrite_atoms_section(solv_mod['atoms'], 's')
+        sol_mod = dict(sol_sec)
+        if 'atoms' in sol_mod and sol_mod['atoms']:
+            sol_mod['atoms'] = rewrite_atoms_section(sol_mod['atoms'], 'p')
+
+        # Write updated ITPs with requested names
+        solvent_out = outdir / solvent_outname
+        solute_out  = outdir / solute_outname
+        write_itp(solvent_out, solv_mod)
+        write_itp(solute_out,  sol_mod)
+
+        # Ensure #includes in topol.top (idempotent)
+        include_lines = [
+            '#include "./toppar/forcefield.itp"',
+            f'#include "./toppar/{solvent_outname}"',
+            f'#include "./toppar/{solute_outname}"',
+        ]
+        top_txt = topol_top.read_text()
+        missing = [L for L in include_lines if L not in top_txt]
+        if missing:
+            lines = top_txt.splitlines()
+            insertion_idx = None
+            for i, ln in enumerate(lines):
+                s = ln.strip().lower()
+                if s.startswith("[ system ]") or s.startswith("[ molecules ]"):
+                    insertion_idx = i
+                    break
+            if insertion_idx is None:
+                new_txt = top_txt.rstrip() + "\n\n" + "\n".join(include_lines) + "\n"
+            else:
+                new_txt = "\n".join(lines[:insertion_idx] + include_lines + [""] + lines[insertion_idx:])
+            topol_top.write_text(new_txt)
+
+        return StepOutput(
+            name="prepare_topology",
+            files={
+                "forcefield_itp": str((outdir / "forcefield.itp").resolve()),
+                "solvent_itp": str(solvent_out.resolve()),
+                "solute_itp":  str(solute_out.resolve()),
+                "topol_top":   str(topol_top.resolve()),
+            },
+            meta={
+                "solvent_suffix": "s",
+                "solute_suffix": "p",
+                "includes_added": bool(missing),
+            },
+        )
+
     # ── orchestrator ───────────────────────────────────────────────────────────
 
-    def orchestrate(
-        self,
-        steps: Iterable[str],
-        *,
-        inputs: Dict[str, Any],
-        overrides: Optional[Dict[str, Dict[str, Any]]] = None,
-        strict: bool = True,
-    ) -> Dict[str, StepOutput]:
-        """
-        Execute named steps in order. Promotes common outputs into context for downstream steps.
-        """
-        ctx: Dict[str, Any] = dict(inputs)
-        results: Dict[str, StepOutput] = {}
+    def orchestrate(self, steps, *, inputs, overrides=None, strict=True) -> Dict[str, StepOutput]:
+        ctx = dict(inputs)
+        results = {}
         overrides = overrides or {}
 
         for name in steps:
@@ -580,24 +707,26 @@ class GmxAPI:
                 print(f"[WARN] Skipping unknown step: {name}")
                 continue
 
-            # Merge context + per-step overrides and call the step
-            kwargs = {**ctx, **overrides.get(name, {})}
-            out: StepOutput = fn(**kwargs)  # type: ignore[misc]
+            # merge then filter by function signature
+            merged = {**ctx, **overrides.get(name, {})}
+            sig = inspect.signature(fn)
+            allowed = {k: v for k, v in merged.items() if k in sig.parameters}
+
+            out: StepOutput = fn(**allowed)  # type: ignore[misc]
             results[name] = out
 
-            # Promote canonical outputs into ctx for typical chains
+            # promote outputs (your existing logic)
+            # promote outputs
             if name == "create_box":
                 ctx["solute_box_gro"] = out.files["gro"]
                 ctx["gro"] = out.files["gro"]
-            elif name == "solvent_box":
+            elif name == "solvent_box":                 # <-- match the registry key
+                ctx["solvent_box_gro"] = out.files["gro"]
+                ctx["gro"] = out.files["gro"]
+            elif name in ("combine_solvate", "solvate"):
                 ctx["gro"] = out.files["gro"]
             elif name in ("mdrun_em", "mdrun_nvt"):
                 if out.files.get("gro"):
                     ctx["gro"] = out.files["gro"]
-            elif name == "combine_solvate":
-                ctx["gro"] = out.files["gro"]
-
-            # Stash metadata (optional)
-            ctx[f"{name}__meta"] = out.meta
 
         return results
