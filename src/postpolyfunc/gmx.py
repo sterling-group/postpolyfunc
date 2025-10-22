@@ -62,6 +62,7 @@ class GmxAPI:
             "normalize_atomnames": self.normalize_atomnames_step,   #fix .atom names to match .itp names
             "normalize_topol": self.normalize_topol_step,      # fix topol.top to match .itp and .gro names
             "grompp_em": self.grompp_em_step,                # EM preproc
+            "mdrun_em": self.mdrun_em_step,                  # EM run  
 
         }
 #TODO 
@@ -458,41 +459,89 @@ class GmxAPI:
     def mdrun_em_step(
     self,
     *,
-    tpr: str | Path,
-    deffnm: str = "em",
-) -> StepOutput:
+    tpr: str | Path = "min.tpr",          # TPR from grompp_em_step
+    deffnm: str = "min",                  # basename for outputs
+    np: int = 8,                          # number of MPI ranks
+    ntomp: int | None = None,             # OpenMP threads per rank
+    extra_args: list[str] | None = None,  # e.g., ["-pin", "on"]
+    env: dict | None = None,              # custom environment vars
+):
+        """
+        Run energy minimization using GROMACS via MPI.
+
+        Equivalent CLI:
+            mpirun -np <np> gmx_mpi mdrun -v -s <tpr> -deffnm <deffnm> [-ntomp N] [extra_args...]
+
+        Returns:
+            SimpleNamespace(files=<dict>, log=<str>, cmd=<list>)
+        """
+        import os
+        import shutil
+        import subprocess
         from pathlib import Path
-        import gmxapi as gmx
+        from types import SimpleNamespace
 
-        tpr = str(Path(tpr).expanduser().resolve())
-        # Tell gmxapi where we expect the primary outputs to land
-        out_gro = str((self.workdir / f"{deffnm}.gro").resolve())
-        out_edr = str((self.workdir / f"{deffnm}.edr").resolve())
-        out_log = str((self.workdir / f"{deffnm}.log").resolve())
-        out_trr = str((self.workdir / f"{deffnm}.trr").resolve())
+        workdir = Path(self.workdir).resolve()
+        tpr_path = (Path(tpr) if Path(tpr).is_absolute() else workdir / tpr).resolve()
 
-        args = ["mdrun", "-deffnm", deffnm]
-        op = gmx.commandline_operation(
+        if not tpr_path.exists():
+            raise FileNotFoundError(f"TPR not found: {tpr_path}")
+
+        # --- verify binaries ---
+        if shutil.which("mpirun") is None:
+            raise FileNotFoundError("mpirun not found in PATH.")
+        if shutil.which(self.executable) is None:
+            raise FileNotFoundError(f"GROMACS executable '{self.executable}' not found in PATH.")
+
+        # --- build command ---
+        cmd = [
+            "mpirun",
+            "-np", str(np),
             self.executable,
-            args,
-            input_files={"-s": tpr},
-            output_files={"-c": out_gro, "-e": out_edr, "-g": out_log, "-o": out_trr},
-        )
-        logging.info(f"Running mdrun for EM: {self.executable} {' '.join(shlex.quote(a) for a in args)}")
-        op.run()
+            "mdrun",
+            "-v",
+            "-s", str(tpr_path),
+            "-deffnm", str(deffnm),
+        ]
+        if ntomp is not None:
+            cmd += ["-ntomp", str(ntomp)]
+        if extra_args:
+            cmd += list(map(str, extra_args))
 
-        # Collect outputs (may already be exactly at those paths)
-        out = op.output.file
-        return StepOutput(
-            name="mdrun_em",
-            files={
-                "gro": str(Path(out["-c"].result()).resolve()),
-                "edr": str(Path(out["-e"].result()).resolve()),
-                "log": str(Path(out["-g"].result()).resolve()),
-                "trr": str(Path(out["-o"].result()).resolve()),
-            },
-            meta={"deffnm": deffnm},
-        )
+        # --- environment setup ---
+        run_env = os.environ.copy()
+        if ntomp is not None:
+            run_env.setdefault("OMP_NUM_THREADS", str(ntomp))
+        if env:
+            run_env.update({str(k): str(v) for k, v in env.items()})
+
+        # --- execute ---
+        try:
+            subprocess.run(cmd, cwd=workdir, env=run_env, check=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"mdrun failed (exit {e.returncode}). Command: {' '.join(cmd)}") from e
+
+        # --- gather output files ---
+        base = workdir / deffnm
+        produced = {
+            "tpr": tpr_path,                    # input
+            "log": base.with_suffix(".log"),
+            "edr": base.with_suffix(".edr"),
+            "gro": base.with_suffix(".gro"),
+            "cpt": base.with_suffix(".cpt"),
+            "trr": base.with_suffix(".trr"),
+            "xtc": base.with_suffix(".xtc"),
+        }
+        files = {k: str(p) for k, p in produced.items() if p.exists()}
+
+        # --- log ---
+        log = f"mpirun -np {np} {self.executable} mdrun -v -s {tpr_path.name} -deffnm {deffnm}"
+        if ntomp:
+            log += f" -ntomp {ntomp}"
+        if extra_args:
+            log += " " + " ".join(map(str, extra_args))
+
+        return SimpleNamespace(files=files, log=log, cmd=cmd)
 
     def grompp_nvt_step(
     self,
