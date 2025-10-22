@@ -1,19 +1,18 @@
 # gmx.py
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Union, List, Tuple
-import shutil
+import shutil, subprocess, os
 import gmxapi as gmx
 import logging
 import time
 import shlex
-import subprocess
 import inspect
 import re
 from types import SimpleNamespace
-
+from pathlib import Path
 
 # ──────────────────────────
 # Orchestration types
@@ -24,6 +23,18 @@ class StepOutput:
     name: str
     files: Dict[str, str] = field(default_factory=dict)  # logical key -> absolute path
     meta: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class StepRecord:
+        phase: str
+        step: str               # "grompp" or "mdrun"
+        cmd: list[str] | None
+        cli: str | None
+        files: dict[str, str]
+        cwd: str
+        ok: bool
+        notes: str | None = None
 
 
 # ──────────────────────────
@@ -385,223 +396,6 @@ class GmxAPI:
             name="solvate",
             files={"gro": str(combined)},
             meta={"solvent_resname": solvent_resname, "nmol_solvent": int(nmol_solvent)},
-        )
-
-    def grompp_em_step(
-    self,
-    *,
-    em_mdp: str | Path,                 # e.g. "./min.mdp"
-    gro: str | Path,                    # e.g. "solvated.gro" (already normalized)
-    topol_top: str | Path = "topol.top",
-    out_tpr: str | Path = "min.tpr",
-    mdout_mdp: str | Path = "mdout.mdp",
-    maxwarn: int = 1,
-):
-        """
-        Preprocess energy-minimization: gmx grompp -f <em_mdp> -c <gro> -p <topol_top> -o <out_tpr> --maxwarn <maxwarn>
-        Writes 'out_tpr' (TPR) and 'mdout.mdp' (expanded MDP).
-        """
-        from pathlib import Path
-        from types import SimpleNamespace
-
-        workdir = Path(self.workdir).resolve()
-        em_mdp_path   = (Path(em_mdp)   if Path(em_mdp).is_absolute()   else workdir / em_mdp).resolve()
-        gro_path      = (Path(gro)      if Path(gro).is_absolute()      else workdir / gro).resolve()
-        topol_top_path= (Path(topol_top)if Path(topol_top).is_absolute() else workdir / topol_top).resolve()
-        out_tpr_path  = (Path(out_tpr)  if Path(out_tpr).is_absolute()  else workdir / out_tpr).resolve()
-        mdout_path    = (Path(mdout_mdp)if Path(mdout_mdp).is_absolute()else workdir / mdout_mdp).resolve()
-
-        for p, label in [(em_mdp_path,"em_mdp"), (gro_path,"gro"), (topol_top_path,"topol_top")]:
-            if not p.exists():
-                raise FileNotFoundError(f"{label} not found: {p}")
-
-        # Build command
-        args = [
-            "grompp",
-            "-f", str(em_mdp_path),
-            "-c", str(gro_path),
-            "-p", str(topol_top_path),
-            "--maxwarn", 3,
-        ]
-
-        # Launch via your existing commandline_operation helper
-        op = gmx.commandline_operation(
-            self.executable,
-            args,
-            input_files={},
-            output_files={
-                "-o": str(out_tpr_path),
-                "-po": str(mdout_path),
-            },
-        )
-        op.run()
-
-        produced_tpr = Path(op.output.file["-o"].result()).resolve()
-        produced_mdout = None
-        try:
-            produced_mdout = Path(op.output.file["-po"].result()).resolve()
-        except Exception:
-            pass  # not critical
-
-        files = {
-            "tpr": str(produced_tpr),
-            "gro": str(gro_path),
-            "topol_top": str(topol_top_path),
-        }
-        if produced_mdout and produced_mdout.exists():
-            files["mdout_mdp"] = str(produced_mdout)
-
-        log = (f"grompp_em: -f {em_mdp_path.name} -c {gro_path.name} -p {topol_top_path.name} "
-            f"-o {produced_tpr.name} --maxwarn {maxwarn}")
-
-        return SimpleNamespace(files=files, log=log)
-
-    def mdrun_em_step(
-    self,
-    *,
-    tpr: str | Path = "min.tpr",          # TPR from grompp_em_step
-    deffnm: str = "min",                  # basename for outputs
-    np: int = 8,                          # number of MPI ranks
-    ntomp: int | None = None,             # OpenMP threads per rank
-    extra_args: list[str] | None = None,  # e.g., ["-pin", "on"]
-    env: dict | None = None,              # custom environment vars
-):
-        """
-        Run energy minimization using GROMACS via MPI.
-
-        Equivalent CLI:
-            mpirun -np <np> gmx_mpi mdrun -v -s <tpr> -deffnm <deffnm> [-ntomp N] [extra_args...]
-
-        Returns:
-            SimpleNamespace(files=<dict>, log=<str>, cmd=<list>)
-        """
-        import os
-        import shutil
-        import subprocess
-        from pathlib import Path
-        from types import SimpleNamespace
-
-        workdir = Path(self.workdir).resolve()
-        tpr_path = (Path(tpr) if Path(tpr).is_absolute() else workdir / tpr).resolve()
-
-        if not tpr_path.exists():
-            raise FileNotFoundError(f"TPR not found: {tpr_path}")
-
-        # --- verify binaries ---
-        if shutil.which("mpirun") is None:
-            raise FileNotFoundError("mpirun not found in PATH.")
-        if shutil.which(self.executable) is None:
-            raise FileNotFoundError(f"GROMACS executable '{self.executable}' not found in PATH.")
-
-        # --- build command ---
-        cmd = [
-            "mpirun",
-            "-np", str(np),
-            self.executable,
-            "mdrun",
-            "-v",
-            "-s", str(tpr_path),
-            "-deffnm", str(deffnm),
-        ]
-        if ntomp is not None:
-            cmd += ["-ntomp", str(ntomp)]
-        if extra_args:
-            cmd += list(map(str, extra_args))
-
-        # --- environment setup ---
-        run_env = os.environ.copy()
-        if ntomp is not None:
-            run_env.setdefault("OMP_NUM_THREADS", str(ntomp))
-        if env:
-            run_env.update({str(k): str(v) for k, v in env.items()})
-
-        # --- execute ---
-        try:
-            subprocess.run(cmd, cwd=workdir, env=run_env, check=True)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"mdrun failed (exit {e.returncode}). Command: {' '.join(cmd)}") from e
-
-        # --- gather output files ---
-        base = workdir / deffnm
-        produced = {
-            "tpr": tpr_path,                    # input
-            "log": base.with_suffix(".log"),
-            "edr": base.with_suffix(".edr"),
-            "gro": base.with_suffix(".gro"),
-            "cpt": base.with_suffix(".cpt"),
-            "trr": base.with_suffix(".trr"),
-            "xtc": base.with_suffix(".xtc"),
-        }
-        files = {k: str(p) for k, p in produced.items() if p.exists()}
-
-        # --- log ---
-        log = f"mpirun -np {np} {self.executable} mdrun -v -s {tpr_path.name} -deffnm {deffnm}"
-        if ntomp:
-            log += f" -ntomp {ntomp}"
-        if extra_args:
-            log += " " + " ".join(map(str, extra_args))
-
-        return SimpleNamespace(files=files, log=log, cmd=cmd)
-
-    def grompp_nvt_step(
-    self,
-    *,
-    gro: str | Path,
-    top: str | Path,
-    mdp: str | Path,
-    out_tpr: str = "nvt.tpr",
-) -> StepOutput:
-        from pathlib import Path
-        import gmxapi as gmx
-
-        gro = str(Path(gro).expanduser().resolve())
-        top = str(Path(top).expanduser().resolve())
-        mdp = str(Path(mdp).expanduser().resolve())
-        out_tpr = str((self.workdir / out_tpr).resolve())
-
-        op = gmx.commandline_operation(
-            self.executable,
-            ["grompp"],
-            input_files={"-f": mdp, "-c": gro, "-p": top},
-            output_files={"-o": out_tpr},
-        )
-        op.run()
-        produced = Path(op.output.file["-o"].result()).resolve()
-        return StepOutput(name="grompp_nvt", files={"tpr": str(produced)}, meta={})
-
-    def mdrun_nvt_step(
-    self,
-    *,
-    tpr: str | Path,
-    deffnm: str = "nvt",
-) -> StepOutput:
-      
-
-        tpr = str(Path(tpr).expanduser().resolve())
-        out_gro = str((self.workdir / f"{deffnm}.gro").resolve())
-        out_edr = str((self.workdir / f"{deffnm}.edr").resolve())
-        out_log = str((self.workdir / f"{deffnm}.log").resolve())
-        out_trr = str((self.workdir / f"{deffnm}.trr").resolve())
-
-        args = ["mdrun", "-deffnm", deffnm]
-        op = gmx.commandline_operation(
-            self.executable,
-            args,
-            input_files={"-s": tpr},
-            output_files={"-c": out_gro, "-e": out_edr, "-g": out_log, "-o": out_trr},
-        )
-        op.run()
-
-        out = op.output.file
-        return StepOutput(
-            name="mdrun_nvt",
-            files={
-                "gro": str(Path(out["-c"].result()).resolve()),
-                "edr": str(Path(out["-e"].result()).resolve()),
-                "log": str(Path(out["-g"].result()).resolve()),
-                "trr": str(Path(out["-o"].result()).resolve()),
-            },
-            meta={"deffnm": deffnm},
         )
 
     def combine_solvate_step(
@@ -1233,6 +1027,157 @@ class GmxAPI:
 
         print("[INFO] " + msg)
         return SimpleNamespace(files={"topol_top": str(topol_top), "gro": str(gro)}, log=msg)
+
+    def _ensure_registry(self):
+        if not hasattr(self, "registry") or self.registry is None:
+            self.registry = []
+
+    def _reg(self, rec: StepRecord):
+        _ensure_registry(self)
+        self.registry.append(asdict(rec))
+
+    def grompp_step(
+        self,
+        *,
+        mdp: str | Path,             # path to .mdp
+        gro: str | Path,             # input structure
+        topol_top: str | Path,       # topology
+        out_tpr: str | Path | None = None,
+        mdout_mdp: str | Path | None = None,
+        maxwarn: int = 1,
+        phase: str = "em",           # label (em/nvt/npt/…)
+    ):
+        """
+        Generic grompp:
+        gmx grompp -f <mdp> -c <gro> -p <topol_top> -o <phase>.tpr -po <phase>.mdout.mdp --maxwarn N
+        """
+
+        workdir = Path(self.workdir).resolve()
+        mdp_path      = Path(mdp).resolve() if Path(mdp).is_absolute() else (workdir / mdp).resolve()
+        gro_path      = Path(gro).resolve() if Path(gro).is_absolute() else (workdir / gro).resolve()
+        topol_top_path= Path(topol_top).resolve() if Path(topol_top).is_absolute() else (workdir / topol_top).resolve()
+        out_tpr_path  = Path(out_tpr).resolve() if out_tpr else (workdir / f"{phase}.tpr")
+        mdout_path    = Path(mdout_mdp).resolve() if mdout_mdp else (workdir / f"{phase}.mdout.mdp")
+
+        for p, lbl in [(mdp_path,"mdp"), (gro_path,"gro"), (topol_top_path,"topol_top")]:
+            if not p.exists():
+                raise FileNotFoundError(f"{lbl} not found: {p}")
+
+        args = [
+            "grompp",
+            "-f", str(mdp_path),
+            "-c", str(gro_path),
+            "-p", str(topol_top_path),
+            "--maxwarn", str(maxwarn),
+        ]
+        op = gmx.commandline_operation(
+            self.executable, args,
+            input_files={},
+            output_files={"-o": str(out_tpr_path), "-po": str(mdout_path)},
+        )
+        op.run()
+
+        produced_tpr = Path(op.output.file["-o"].result()).resolve()
+        produced_mdout = None
+        try:
+            produced_mdout = Path(op.output.file["-po"].result()).resolve()
+        except Exception:
+            pass
+
+        files = {
+            "tpr": str(produced_tpr),
+            "gro": str(gro_path),
+            "topol_top": str(topol_top_path),
+        }
+        if produced_mdout and produced_mdout.exists():
+            files["mdout_mdp"] = str(produced_mdout)
+
+        cli = f"{self.executable} grompp -f {mdp_path.name} -c {gro_path.name} -p {topol_top_path.name} -o {out_tpr_path.name} -po {mdout_path.name} --maxwarn {maxwarn}"
+
+        _reg(self, StepRecord(
+            phase=phase, step="grompp",
+            cmd=None, cli=cli, files=files,
+            cwd=str(workdir), ok=True, notes=f"Preprocess ({phase})",
+        ))
+
+        return SimpleNamespace(files=files, log=cli)
+
+    def mdrun_step(
+    self,
+    *,
+    tpr: str | Path | None = None,  # if omitted, defaults to <phase>.tpr
+    deffnm: str | None = None,      # if omitted, defaults to <phase>
+    np: int = 8,
+    ntomp: int | None = None,
+    extra_args: list[str] | None = None,
+    env: dict | None = None,
+    phase: str = "em",
+):
+        """
+        Generic mdrun via mpirun:
+        mpirun -np <np> gmx_mpi mdrun -v -s <tpr> -deffnm <deffnm> [-ntomp N] ...
+        """
+        workdir = Path(self.workdir).resolve()
+        tpr_path = Path(tpr).resolve() if tpr else (workdir / f"{phase}.tpr")
+        deffnm_val = deffnm if deffnm else phase
+
+        if not tpr_path.exists():
+            raise FileNotFoundError(f"TPR not found: {tpr_path}")
+        if shutil.which("mpirun") is None:
+            raise FileNotFoundError("mpirun not found in PATH.")
+        if shutil.which(self.executable) is None:
+            raise FileNotFoundError(f"GROMACS executable '{self.executable}' not found in PATH.")
+
+        cmd = [
+            "mpirun", "-np", str(np),
+            self.executable, "mdrun",
+            "-v",
+            "-s", str(tpr_path),
+            "-deffnm", str(deffnm_val),
+        ]
+        if ntomp is not None:
+            cmd += ["-ntomp", str(ntomp)]
+        if extra_args:
+            cmd += list(map(str, extra_args))
+
+        run_env = os.environ.copy()
+        if ntomp is not None:
+            run_env.setdefault("OMP_NUM_THREADS", str(ntomp))
+        if env:
+            run_env.update({str(k): str(v) for k, v in env.items()})
+
+        cli = " ".join(map(str, cmd))
+
+        try:
+            subprocess.run(cmd, cwd=workdir, env=run_env, check=True)
+            ok = True
+        except subprocess.CalledProcessError as e:
+            _reg(self, StepRecord(
+                phase=phase, step="mdrun",
+                cmd=cmd, cli=cli, files={"tpr": str(tpr_path)},
+                cwd=str(workdir), ok=False, notes=f"Exit code {e.returncode}",
+            ))
+            raise RuntimeError(f"mdrun failed (exit {e.returncode}). Command: {cli}") from e
+
+        base = workdir / deffnm_val
+        produced = {
+            "tpr": tpr_path,
+            "log": base.with_suffix(".log"),
+            "edr": base.with_suffix(".edr"),
+            "gro": base.with_suffix(".gro"),
+            "cpt": base.with_suffix(".cpt"),
+            "trr": base.with_suffix(".trr"),
+            "xtc": base.with_suffix(".xtc"),
+        }
+        files = {k: str(p) for k, p in produced.items() if p.exists()}
+
+        _reg(self, StepRecord(
+            phase=phase, step="mdrun",
+            cmd=cmd, cli=cli, files=files,
+            cwd=str(workdir), ok=ok, notes=f"Run ({phase})",
+        ))
+
+        return SimpleNamespace(files=files, log=cli, cmd=cmd)
 
     # ── orchestrator ───────────────────────────────────────────────────────────
 
