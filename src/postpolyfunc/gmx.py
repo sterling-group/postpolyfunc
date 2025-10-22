@@ -61,9 +61,10 @@ class GmxAPI:
             "normalize_resnames": self.normalize_resnames_step,  # fix .gro resnames to match .itp names  
             "normalize_atomnames": self.normalize_atomnames_step,   #fix .atom names to match .itp names
             "normalize_topol": self.normalize_topol_step,      # fix topol.top to match .itp and .gro names
+            "grompp_em": self.grompp_em_step,                # EM preproc
 
         }
-#TODO "grompp_em": self.grompp_em_step,                # EM preproc
+#TODO 
             # "mdrun_em": self.mdrun_em_step,                  # EM run
             # "grompp_nvt": self.grompp_nvt_step,              # NVT preproc
             # "mdrun_nvt": self.mdrun_nvt_step,                # NVT run
@@ -388,54 +389,71 @@ class GmxAPI:
     def grompp_em_step(
     self,
     *,
-    gro: str | Path,
-    top: str | Path,
-    mdp: str | Path,
-    out_tpr: str = "em.tpr",
-) -> StepOutput:
-     
-        gro = str(Path(gro).expanduser().resolve())
-        top = str(Path(top).expanduser().resolve())
-        mdp = str(Path(mdp).expanduser().resolve())
-        out_tpr = str((self.workdir / out_tpr).resolve())
+    em_mdp: str | Path,                 # e.g. "./min.mdp"
+    gro: str | Path,                    # e.g. "solvated.gro" (already normalized)
+    topol_top: str | Path = "topol.top",
+    out_tpr: str | Path = "min.tpr",
+    mdout_mdp: str | Path = "mdout.mdp",
+    maxwarn: int = 1,
+):
+        """
+        Preprocess energy-minimization: gmx grompp -f <em_mdp> -c <gro> -p <topol_top> -o <out_tpr> --maxwarn <maxwarn>
+        Writes 'out_tpr' (TPR) and 'mdout.mdp' (expanded MDP).
+        """
+        from pathlib import Path
+        from types import SimpleNamespace
 
+        workdir = Path(self.workdir).resolve()
+        em_mdp_path   = (Path(em_mdp)   if Path(em_mdp).is_absolute()   else workdir / em_mdp).resolve()
+        gro_path      = (Path(gro)      if Path(gro).is_absolute()      else workdir / gro).resolve()
+        topol_top_path= (Path(topol_top)if Path(topol_top).is_absolute() else workdir / topol_top).resolve()
+        out_tpr_path  = (Path(out_tpr)  if Path(out_tpr).is_absolute()  else workdir / out_tpr).resolve()
+        mdout_path    = (Path(mdout_mdp)if Path(mdout_mdp).is_absolute()else workdir / mdout_mdp).resolve()
+
+        for p, label in [(em_mdp_path,"em_mdp"), (gro_path,"gro"), (topol_top_path,"topol_top")]:
+            if not p.exists():
+                raise FileNotFoundError(f"{label} not found: {p}")
+
+        # Build command
+        args = [
+            "grompp",
+            "-f", str(em_mdp_path),
+            "-c", str(gro_path),
+            "-p", str(topol_top_path),
+            "--maxwarn", 3,
+        ]
+
+        # Launch via your existing commandline_operation helper
         op = gmx.commandline_operation(
             self.executable,
-            ["grompp"],
-            input_files={"-f": mdp, "-c": gro, "-p": top},
-            output_files={"-o": out_tpr},
+            args,
+            input_files={},
+            output_files={
+                "-o": str(out_tpr_path),
+                "-po": str(mdout_path),
+            },
         )
-        logging.info(f"Running grompp for EM: {self.executable} grompp -f {mdp} -c {gro} -p {top} -o {out_tpr}")
         op.run()
-        produced = Path(op.output.file["-o"].result()).resolve()
 
-        return StepOutput(name="grompp_em", files={"tpr": str(produced)}, meta={})
+        produced_tpr = Path(op.output.file["-o"].result()).resolve()
+        produced_mdout = None
+        try:
+            produced_mdout = Path(op.output.file["-po"].result()).resolve()
+        except Exception:
+            pass  # not critical
 
-    def grompp_em_step(
-    self,
-    *,
-    gro: str | Path,
-    top: str | Path,
-    mdp: str | Path,
-    out_tpr: str = "em.tpr",
-) -> StepOutput:
-    
-        gro = str(Path(gro).expanduser().resolve())
-        top = str(Path(top).expanduser().resolve())
-        mdp = str(Path(mdp).expanduser().resolve())
-        out_tpr = str((self.workdir / out_tpr).resolve())
+        files = {
+            "tpr": str(produced_tpr),
+            "gro": str(gro_path),
+            "topol_top": str(topol_top_path),
+        }
+        if produced_mdout and produced_mdout.exists():
+            files["mdout_mdp"] = str(produced_mdout)
 
-        op = gmx.commandline_operation(
-            self.executable,
-            ["grompp"],
-            input_files={"-f": mdp, "-c": gro, "-p": top},
-            output_files={"-o": out_tpr},
-        )
-        logging.info(f"Running grompp for EM: {self.executable} grompp -f {mdp} -c {gro} -p {top} -o {out_tpr}")
-        op.run()
-        produced = Path(op.output.file["-o"].result()).resolve()
+        log = (f"grompp_em: -f {em_mdp_path.name} -c {gro_path.name} -p {topol_top_path.name} "
+            f"-o {produced_tpr.name} --maxwarn {maxwarn}")
 
-        return StepOutput(name="grompp_em", files={"tpr": str(produced)}, meta={})
+        return SimpleNamespace(files=files, log=log)
 
     def mdrun_em_step(
     self,
