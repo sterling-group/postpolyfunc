@@ -13,6 +13,7 @@ import inspect
 import re
 from types import SimpleNamespace
 from pathlib import Path
+from functools import partial
 
 # ──────────────────────────
 # Orchestration types
@@ -55,32 +56,38 @@ class GmxAPI:
         self,
         executable: str = "gmx_mpi",
         workdir: Union[str, Path, None] = None,
-        args: Any = None,  # argparse.Namespace-like; may hold .box, .scale, etc.
+        args: Any = None,
     ):
         self.executable = executable
         self.workdir = Path(workdir) if workdir else Path.cwd()
         self.args = args
         self.workdir.mkdir(parents=True, exist_ok=True)
+        self.registry: List[Dict[str, Any]] = []   # <-- add this
 
-        # Step registry: map name -> bound method
+        # ── Base step registry ────────────────────────────────────────────────
         self._registry: Dict[str, Any] = {
-            "create_box": self.create_boxed_structure_step,  # solute-only box (editconf)
-            "solvent_box": self.solvent_box_step,            # build pure solvent box sized to solute box
-            "solvate": self.solvate_step,              # combine solute + solvent boxes (solvate)
-            "combine_solvate": self.combine_solvate_step,    # combine solute + solvent boxes (solvate) 
-            "prepare_topology": self.prepare_topology_step,  # combine topology files from LigParGen outputs
-            "normalize_resnames": self.normalize_resnames_step,  # fix .gro resnames to match .itp names  
-            "normalize_atomnames": self.normalize_atomnames_step,   #fix .atom names to match .itp names
-            "normalize_topol": self.normalize_topol_step,      # fix topol.top to match .itp and .gro names
-            "grompp_em": self.grompp_em_step,                # EM preproc
-            "mdrun_em": self.mdrun_em_step,                  # EM run  
-
+            "create_box": self.create_boxed_structure_step,     # solute-only box (editconf)
+            "solvent_box": self.solvent_box_step,               # build pure solvent box
+            "solvate": self.solvate_step,                       # combine solute + solvent
+            "combine_solvate": self.combine_solvate_step,       # same idea, if used
+            "prepare_topology": self.prepare_topology_step,     # merge topologies
+            "normalize_resnames": self.normalize_resnames_step, # fix .gro resnames
+            "normalize_atomnames": self.normalize_atomnames_step, # fix atom names
+            "normalize_topol": self.normalize_topol_step,       # fix topol.top consistency
         }
-#TODO 
-            # "mdrun_em": self.mdrun_em_step,                  # EM run
-            # "grompp_nvt": self.grompp_nvt_step,              # NVT preproc
-            # "mdrun_nvt": self.mdrun_nvt_step,                # NVT run
-            # "combine_solvate": self.combine_solvate_step,    # merge solute + solvent via gmx solvate
+
+        # ── Dynamically register MD phases (EM, NVT, NPT, etc.) ──────────────
+        def register_md_phase(phase: str):
+            """Add grompp:<phase> and mdrun:<phase> to the registry."""
+            self._registry[f"grompp:{phase}"] = partial(self.grompp_step, phase=phase)
+            self._registry[f"mdrun:{phase}"]  = partial(self.mdrun_step, phase=phase)
+
+        # Add whatever phases you support
+        for ph in ("em", "nvt", "npt","prod"):
+            register_md_phase(ph)
+
+        # Optional: a shared registry for provenance logs
+        self.registry = []  # filled by _reg(self, StepRecord(...))
     # ── steps ─────────────────────────────────────────────────────────────────
 
     def create_boxed_structure_step(
@@ -1028,13 +1035,13 @@ class GmxAPI:
         print("[INFO] " + msg)
         return SimpleNamespace(files={"topol_top": str(topol_top), "gro": str(gro)}, log=msg)
 
-    def _ensure_registry(self):
-        if not hasattr(self, "registry") or self.registry is None:
-            self.registry = []
+    # def _ensure_registry(self):
+    #     if not hasattr(self, "registry") or self.registry is None:
+    #         self.registry = []
 
-    def _reg(self, rec: StepRecord):
-        _ensure_registry(self)
-        self.registry.append(asdict(rec))
+    # def _reg(self, rec: StepRecord):
+    #     _ensure_registry(self)
+    #     self.registry.append(asdict(rec))
 
     def grompp_step(
         self,
@@ -1094,11 +1101,7 @@ class GmxAPI:
 
         cli = f"{self.executable} grompp -f {mdp_path.name} -c {gro_path.name} -p {topol_top_path.name} -o {out_tpr_path.name} -po {mdout_path.name} --maxwarn {maxwarn}"
 
-        _reg(self, StepRecord(
-            phase=phase, step="grompp",
-            cmd=None, cli=cli, files=files,
-            cwd=str(workdir), ok=True, notes=f"Preprocess ({phase})",
-        ))
+        
 
         return SimpleNamespace(files=files, log=cli)
 
@@ -1152,11 +1155,6 @@ class GmxAPI:
             subprocess.run(cmd, cwd=workdir, env=run_env, check=True)
             ok = True
         except subprocess.CalledProcessError as e:
-            _reg(self, StepRecord(
-                phase=phase, step="mdrun",
-                cmd=cmd, cli=cli, files={"tpr": str(tpr_path)},
-                cwd=str(workdir), ok=False, notes=f"Exit code {e.returncode}",
-            ))
             raise RuntimeError(f"mdrun failed (exit {e.returncode}). Command: {cli}") from e
 
         base = workdir / deffnm_val
@@ -1171,26 +1169,27 @@ class GmxAPI:
         }
         files = {k: str(p) for k, p in produced.items() if p.exists()}
 
-        _reg(self, StepRecord(
-            phase=phase, step="mdrun",
-            cmd=cmd, cli=cli, files=files,
-            cwd=str(workdir), ok=ok, notes=f"Run ({phase})",
-        ))
-
+        
         return SimpleNamespace(files=files, log=cli, cmd=cmd)
+
+        
 
     # ── orchestrator ───────────────────────────────────────────────────────────
 
     def orchestrate(self, steps, *, inputs, overrides=None, strict=True) -> Dict[str, StepOutput]:
         """
-        Run the registered steps in order, passing only the parameters each step accepts,
-        and promote key outputs into the shared ctx for downstream steps.
-        No GRO/ITP normalization logic lives here.
+        Run registered steps in order, passing only parameters each step accepts.
+        Promotes key outputs into a shared context (ctx) for downstream steps.
+
+        Patches:
+        - Validates missing required params per step (clear errors).
+        - Generic chaining: after any 'mdrun:<phase>' that writes a GRO, ctx['gro'] is updated.
+        - Convenience: after any 'grompp:<phase>', ctx['tpr'] and ctx[f'{phase}_tpr'] are updated.
         """
         import inspect
         from typing import Dict
 
-        ctx = dict(inputs)
+        ctx = dict(inputs)  # mutable shared context
         results: Dict[str, StepOutput] = {}
         overrides = overrides or {}
 
@@ -1202,16 +1201,41 @@ class GmxAPI:
                 print(f"[WARN] Skipping unknown step: {name}")
                 continue
 
-            # Merge inputs with per-step overrides, filter by fn signature
+            # Merge ctx with per-step overrides, then filter by the function signature
             merged = {**ctx, **overrides.get(name, {})}
             sig = inspect.signature(fn)
             allowed = {k: v for k, v in merged.items() if k in sig.parameters}
 
-            # Run the step
+            # ---- Validation: detect missing required parameters (before calling) ----
+            missing_required = []
+            for pname, p in sig.parameters.items():
+                if pname == "self":
+                    continue
+                # a parameter is "required" if it has no default and isn't *args/**kwargs
+                if (p.default is inspect._empty and
+                    p.kind in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    ) and
+                    pname not in allowed):
+                    missing_required.append(pname)
+
+            if missing_required:
+                avail = ", ".join(sorted(merged.keys()))
+                need  = ", ".join(missing_required)
+                raise TypeError(
+                    f"Step '{name}' is missing required parameters: [{need}]. "
+                    f"Available keys to this step: [{avail}]"
+                )
+
+            # ---- Execute the step ----
             out: StepOutput = fn(**allowed)  # type: ignore[misc]
             results[name] = out
 
-            # Promote common outputs for downstream steps
+            # ---- Promotions: make downstream wiring automatic ----
+
+            # Structure-producing steps: set ctx['gro']
             if name == "create_box":
                 ctx["solute_box_gro"] = out.files["gro"]
                 ctx["gro"] = out.files["gro"]
@@ -1220,27 +1244,39 @@ class GmxAPI:
                 ctx["solvent_box_gro"] = out.files["gro"]
                 ctx["gro"] = out.files["gro"]
 
+            elif name in ("combine_solvate", "solvate"):
+                ctx["gro"] = out.files["gro"]
+
+            elif name == "normalize_resnames":
+                ctx["gro"] = out.files["gro"]
+
+            elif name == "normalize_atomnames":
+                ctx["gro"] = out.files["gro"]
+
+            # Topology-producing step: set ctx['topol_top'] (+ expose itps if present)
             elif name == "prepare_topology":
-                # expose paths produced by the topology-prep step
                 ctx["forcefield_itp"] = out.files.get("forcefield_itp")
                 ctx["solvent_itp"]    = out.files.get("solvent_itp")
                 ctx["solute_itp"]     = out.files.get("solute_itp")
                 ctx["topol_top"]      = out.files.get("topol_top")
-                
-            elif name == "normalize_resnames":
-                ctx["gro"] = out.files["gro"]    # ensure EM/NVT read the normalized GRO
 
-            elif name == "normalize_atomnames":
-                ctx["gro"] = out.files["gro"]        
-            elif name in ("combine_solvate", "solvate"):
-                ctx["gro"] = out.files["gro"]
-
-            elif name in ("mdrun_em", "mdrun_nvt"):
-                if out.files.get("gro"):
-                    ctx["gro"] = out.files["gro"]
             elif name == "normalize_topol":
                 ctx["topol_top"] = out.files["topol_top"]
-                # ctx["gro"] already set earlier; keep as-is
+
+            # Generic MD chaining:
+            # - Any 'grompp:<phase>' updates TPR in context.
+            # - Any 'mdrun:<phase>' that yields a GRO updates ctx['gro'] so the next phase uses it.
+            if name.startswith("grompp:"):
+                phase = name.split(":", 1)[1] or "md"
+                tpr = out.files.get("tpr")
+                if tpr:
+                    ctx["tpr"] = tpr                 # last produced tpr
+                    ctx[f"{phase}_tpr"] = tpr        # phase-specific tpr
+
+            if name.startswith("mdrun:"):
+                if out.files.get("gro"):
+                    ctx["gro"] = out.files["gro"]    # hand off final structure to next phase
+
         return results
 
 

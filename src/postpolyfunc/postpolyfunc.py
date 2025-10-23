@@ -121,12 +121,11 @@ def run_workflow(args) -> int:
     gmx = GmxAPI(workdir=str(outdir), executable=args.gmx)
     gmx.args = args  # for create_box to read --box if provided
 
-    # ✅ Include em_mdp (and nvt_mdp for later) in inputs
+    # Include em_mdp (and nvt_mdp for later) in inputs; grompp will take mdp via overrides
     inputs = {
         "input_pdb": func_path,
         "em_mdp": Path(args.em_mdp),
         "nvt_mdp": Path(args.nvt_mdp),
-        # Seed defaults; later steps promote ctx["gro"] and ctx["topol_top"]
     }
 
     topol = gmx.ensure_topol_top(path=outdir / "topol.top")
@@ -143,7 +142,7 @@ def run_workflow(args) -> int:
         },
         "solvate": {
             "outname": "solvated.gro",
-            "topol_top": topol,  # exists now
+            "topol_top": topol,
         },
         "prepare_topology": {
             "solvent_itp": outdir / "solvent.gmx.itp",
@@ -153,20 +152,48 @@ def run_workflow(args) -> int:
             "solvent_outname": "solvent.itp",
             "solute_outname":  "solute.itp",
         },
-        # Optional: customize EM outputs
-        "grompp_em": {
-            "out_tpr": outdir / "min.tpr",
-            "mdout_mdp": outdir / "mdout.mdp",
+
+        # ✅ Generic EM steps (match step keys, supply mdp=)
+        "grompp:em": {
+            "mdp": Path(args.em_mdp),
+            "out_tpr": outdir / "em.tpr",
+            "mdout_mdp": outdir / "em.mdout.mdp",
             "maxwarn": 1,
         },
-        # Optional: MPI knobs for the run step
-        "mdrun_em": {
-            "tpr": outdir / "min.tpr",
+        "mdrun:em": {
+            "tpr": outdir / "em.tpr",   # optional; would default to em.tpr anyway
             "deffnm": "min",
             "np": 8,
             "ntomp": 2,
             "extra_args": ["-pin", "on"],
         },
+        "grompp:nvt": {
+            "mdp": Path(args.nvt_mdp),
+            "out_tpr": outdir / "nvt.tpr",
+            "mdout_mdp": outdir / "nvt.mdout.mdp",
+            "maxwarn": 1,
+        },
+        "mdrun:nvt": {
+            "tpr": outdir / "nvt.tpr",
+            "deffnm": "nvt",
+            "np": 8,
+            "ntomp": 2,
+            "extra_args": ["-pin", "on"],
+        },
+        # Optional NPT step if npt_mdp provided
+        "grompp:npt": {
+            "mdp": Path(args.npt_mdp),
+            "out_tpr": outdir / "npt.tpr",
+            "mdout_mdp": outdir / "npt.mdout.mdp",
+            "maxwarn": 1,
+        } if getattr(args, "npt_mdp", None) else {},
+        "mdrun:npt": {
+            "tpr": outdir / "npt.tpr",
+            "deffnm": "npt",
+            "np": 8,
+            "ntomp": 2,
+            "extra_args": ["-pin", "on"],
+        } if getattr(args, "npt_mdp", None) else {},    
     }
 
     results = gmx.orchestrate(
@@ -178,8 +205,12 @@ def run_workflow(args) -> int:
             "normalize_resnames",
             "normalize_atomnames",
             "normalize_topol",
-            "grompp_em",   # needs: em_mdp, gro, topol_top
-            "mdrun_em",    # 🔁 use this key so promotions work
+            "grompp:em",
+            "mdrun:em",
+            "grompp:nvt",
+            "mdrun:nvt",
+            "grompp:npt",
+            "mdrun:npt",
         ],
         inputs=inputs,
         overrides=overrides,
@@ -193,15 +224,14 @@ def run_workflow(args) -> int:
     print(f"  Solvent itp:     {results['prepare_topology'].files['solvent_itp']}")
     print(f"  Solute  itp:     {results['prepare_topology'].files['solute_itp']}")
     print(f"  Updated topol:   {results['prepare_topology'].files['topol_top']}")
-    if "grompp_em" in results:
-        print(f"  EM TPR:          {results['grompp_em'].files['tpr']}")
-    if "mdrun_em" in results:
-        gro_out = results["mdrun_em"].files.get("gro")
-        if gro_out:
-            print(f"  Minimized GRO:   {gro_out}")
-        print(f"  EM log:          {results['mdrun_em'].files.get('log', 'N/A')}")
+    if "grompp:em" in results:
+        print(f"  EM TPR:          {results['grompp:em'].files['tpr']}")
+    if "mdrun:em" in results:
+        print(f"  Minimized GRO:   {results['mdrun:em'].files.get('gro', 'N/A')}")
+        print(f"  EM log:          {results['mdrun:em'].files.get('log', 'N/A')}")
 
     print("[INFO] Workflow complete (minimization finished).")
     return 0
+
 
         
