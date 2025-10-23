@@ -79,6 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Path to energy-minimization .mdp file.")
     p.add_argument("--nvt-mdp", type=Path, required=True,
                    help="Path to short NVT equilibration .mdp file.")
+    p.add_argument("--npt-mdp", dest="npt_mdp", type=Path, required=False,
+               help="Path to NPT .mdp file (optional).")
+    p.add_argument("--prod-mdp", dest="prod_mdp", type=Path, required=False,
+               help="Path to production MD (.mdp). If set, runs the production phase.")
 
     # --- Logging / flow control ---
     p.add_argument("--skip-ligpargen", action="store_true",
