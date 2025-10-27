@@ -12,6 +12,7 @@ from .postpolyfunc import run_workflow
 
 import argparse
 from pathlib import Path
+import csv
 
 def _ratio(value: str) -> float:
     x = float(value)
@@ -37,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Polymer (solute) structure file (e.g., .pdb or .mol2).")
     p.add_argument("--outdir", type=Path, default=Path("outputs"),
                    help="Output directory (default: outputs).")
+    p.add_argument("--csv", type=Path, default=None, help="CSV file to override CLI arguments.")
 
     # --- Solvent definition (choose one) ---
     g_solvent = p.add_mutually_exclusive_group(required=True)
@@ -106,11 +108,32 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.box is not None and len(args.box) != 3:
         raise ValueError("--box must provide exactly 3 numbers (X Y Z in nm).")
 
-
+def override_args_with_csv(args: argparse.Namespace) -> argparse.Namespace:
+    if args.csv is not None:
+        with open(args.csv, newline='') as csvfile:
+            reader = csv.DictReader(csvfile)
+            row = next(reader)  # Only first row for now
+            # Override CLI args with CSV values if present
+            if "solute" in row and row["solute"]:
+                args.solute = Path(row["solute"])
+            if "solvent" in row and row["solvent"]:
+                args.solvent = Path(row["solvent"])
+                args.solvent_smiles = None
+            if "solvent_smiles" in row and row["solvent_smiles"]:
+                args.solvent_smiles = row["solvent_smiles"]
+                args.solvent = None
+            if "ratio" in row and row["ratio"]:
+                args.ratio = float(row["ratio"])
+            if "nsolv" in row and row["nsolv"]:
+                args.nsolv = int(row["nsolv"])
+            if "mode" in row and row["mode"]:
+                args.mode = row["mode"]
+    return args
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    args = override_args_with_csv(args)
     setup_logging(args.verbose)
     return run_workflow(args)  # 👈 delegate all logic
 
