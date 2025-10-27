@@ -140,16 +140,6 @@ def _rewrite_gro_resname(gro_path: Path, target_resname: str, only_if_name_in: s
     p.write_text("\n".join([title, f"{natoms}", *fixed, box_line]) + "\n")
     return changed
 
-def _normalize_combined_gro_with_itps(combined_gro: Path, solute_itp: Path, solvent_itp: Path) -> tuple[int, int]:
-    solute_name  = _read_moleculetype_name(solute_itp)
-    solvent_name = _read_moleculetype_name(solvent_itp)
-    # Change MOL → solute_name; also coerce generic waters (if any) → solvent_name
-    solvent_like = {"SOL", "WAT", "HOH"}
-    n_mol  = _rewrite_gro_resname(combined_gro, solute_name, only_if_name_in={"MOL"})
-    n_solv = _rewrite_gro_resname(combined_gro, solvent_name, only_if_name_in=solvent_like)
-    return n_mol, n_solv
-
-
 def run_functionalization(solute_path: Path, outdir: Path, ratio: float, seed: int, mode: str) -> Path:
     atoms = read(solute_path)
     f = PolymerFunctionalizer(functionalization_ratio=ratio, seed=seed, mode=mode)
@@ -158,7 +148,6 @@ def run_functionalization(solute_path: Path, outdir: Path, ratio: float, seed: i
     out_path = outdir / f"{solute_path.stem}_func.pdb"
     write(out_path, new_atoms)
     return out_path
-
 
 def run_workflow(args) -> int:
     """
