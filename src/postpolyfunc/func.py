@@ -2,6 +2,7 @@
 import random
 from ase import Atoms
 from ase.neighborlist import neighbor_list
+import math
 
 
 class PolymerFunctionalizer:
@@ -24,6 +25,10 @@ class PolymerFunctionalizer:
         self.mode = mode
         
     def functionalize_carbons(self, atoms: Atoms) -> Atoms:
+        # ✅ Skip functionalization entirely if ratio is 0.0
+        if self.functionalization_ratio == 0.0:
+            return atoms.copy()
+
         if self.mode == "carbonyl":
             return self._carbonyl(atoms)
         # Future hooks:
@@ -33,6 +38,7 @@ class PolymerFunctionalizer:
         #     return self._epoxide(atoms)
         else:
             raise NotImplementedError(f"Functionalization mode not implemented: {self.mode}")
+
         
     def _carbonyl(self, atoms):
         """
@@ -53,7 +59,7 @@ class PolymerFunctionalizer:
         carbon_indices = [i for i, sym in enumerate(symbols) if sym == 'C']
 
         # Calculate number of carbons to functionalize
-        num_carbons_to_functionalize = int(len(carbon_indices) * self.functionalization_ratio)
+        num_carbons_to_functionalize = math.ceil(len(carbon_indices) * self.functionalization_ratio)
         if num_carbons_to_functionalize == 0:
             return atoms.copy()
 
