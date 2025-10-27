@@ -1044,32 +1044,44 @@ class GmxAPI:
     #     self.registry.append(asdict(rec))
 
     def grompp_step(
-        self,
-        *,
-        mdp: str | Path,             # path to .mdp
-        gro: str | Path,             # input structure
-        topol_top: str | Path,       # topology
-        out_tpr: str | Path | None = None,
-        mdout_mdp: str | Path | None = None,
-        maxwarn: int = 1,
-        phase: str = "em",           # label (em/nvt/npt/…)
-    ):
+    self,
+    *,
+    mdp: str | Path,             # path to .mdp
+    gro: str | Path,             # input structure (.gro or .pdb supported by grompp)
+    topol_top: str | Path,       # topology (topol.top)
+    out_tpr: str | Path | None = None,
+    mdout_mdp: str | Path | None = None,
+    maxwarn: int = 1,
+    phase: str = "em",           # label (em/nvt/npt/…)
+    checkpoint: str | Path | None = None,  # optional: previous <deffnm>.cpt
+):
         """
         Generic grompp:
-        gmx grompp -f <mdp> -c <gro> -p <topol_top> -o <phase>.tpr -po <phase>.mdout.mdp --maxwarn N
+        gmx grompp -f <mdp> -c <gro> -p <topol_top> [-t <checkpoint.cpt>] -o <phase>.tpr -po <phase>.mdout.mdp --maxwarn N
         """
 
         workdir = Path(self.workdir).resolve()
-        mdp_path      = Path(mdp).resolve() if Path(mdp).is_absolute() else (workdir / mdp).resolve()
-        gro_path      = Path(gro).resolve() if Path(gro).is_absolute() else (workdir / gro).resolve()
-        topol_top_path= Path(topol_top).resolve() if Path(topol_top).is_absolute() else (workdir / topol_top).resolve()
-        out_tpr_path  = Path(out_tpr).resolve() if out_tpr else (workdir / f"{phase}.tpr")
-        mdout_path    = Path(mdout_mdp).resolve() if mdout_mdp else (workdir / f"{phase}.mdout.mdp")
 
+        # Resolve paths (absolute kept, relative made relative to workdir)
+        def _res(p): 
+            p = Path(p)
+            return p.resolve() if p.is_absolute() else (workdir / p).resolve()
+
+        mdp_path        = _res(mdp)
+        gro_path        = _res(gro)
+        topol_top_path  = _res(topol_top)
+        out_tpr_path    = _res(out_tpr) if out_tpr else (workdir / f"{phase}.tpr")
+        mdout_path      = _res(mdout_mdp) if mdout_mdp else (workdir / f"{phase}.mdout.mdp")
+        cpt_path        = _res(checkpoint) if checkpoint else None
+
+        # Existence checks
         for p, lbl in [(mdp_path,"mdp"), (gro_path,"gro"), (topol_top_path,"topol_top")]:
             if not p.exists():
                 raise FileNotFoundError(f"{lbl} not found: {p}")
+        if cpt_path and not cpt_path.exists():
+            raise FileNotFoundError(f"checkpoint (.cpt) not found: {cpt_path}")
 
+        # Build grompp args
         args = [
             "grompp",
             "-f", str(mdp_path),
@@ -1077,13 +1089,20 @@ class GmxAPI:
             "-p", str(topol_top_path),
             "--maxwarn", str(maxwarn),
         ]
+        if cpt_path:
+            # Carry velocities/temperature/state forward
+            args.extend(["-t", str(cpt_path)])
+
+        # Run via gmxapi commandline operation
         op = gmx.commandline_operation(
-            self.executable, args,
-            input_files={},
+            self.executable,
+            args,
+            input_files={},  # using absolute paths; no staging needed
             output_files={"-o": str(out_tpr_path), "-po": str(mdout_path)},
         )
         op.run()
 
+        # Collect outputs
         produced_tpr = Path(op.output.file["-o"].result()).resolve()
         produced_mdout = None
         try:
@@ -1098,10 +1117,14 @@ class GmxAPI:
         }
         if produced_mdout and produced_mdout.exists():
             files["mdout_mdp"] = str(produced_mdout)
+        if cpt_path:
+            files["checkpoint"] = str(cpt_path)
 
-        cli = f"{self.executable} grompp -f {mdp_path.name} -c {gro_path.name} -p {topol_top_path.name} -o {out_tpr_path.name} -po {mdout_path.name} --maxwarn {maxwarn}"
-
-        
+        # Human-readable CLI (filenames only)
+        cli = f"{self.executable} grompp -f {mdp_path.name} -c {gro_path.name} -p {topol_top_path.name}"
+        if cpt_path:
+            cli += f" -t {cpt_path.name}"
+        cli += f" -o {out_tpr_path.name} -po {mdout_path.name} --maxwarn {maxwarn}"
 
         return SimpleNamespace(files=files, log=cli)
 
@@ -1118,7 +1141,8 @@ class GmxAPI:
 ):
         """
         Generic mdrun via mpirun:
-        mpirun -np <np> gmx_mpi mdrun -v -s <tpr> -deffnm <deffnm> [-ntomp N] ...
+        mpirun -np <np> gmx_mpi mdrun -v -s <tpr> -deffnm <deffnm> [-ntomp N] [extra_args...]
+        Assumes checkpoint will be <deffnm>.cpt and returns it if found.
         """
         workdir = Path(self.workdir).resolve()
         tpr_path = Path(tpr).resolve() if tpr else (workdir / f"{phase}.tpr")
@@ -1134,9 +1158,9 @@ class GmxAPI:
         cmd = [
             "mpirun", "-np", str(np),
             self.executable, "mdrun",
-            "-v",
             "-s", str(tpr_path),
             "-deffnm", str(deffnm_val),
+            "-v",
         ]
         if ntomp is not None:
             cmd += ["-ntomp", str(ntomp)]
@@ -1150,12 +1174,7 @@ class GmxAPI:
             run_env.update({str(k): str(v) for k, v in env.items()})
 
         cli = " ".join(map(str, cmd))
-
-        try:
-            subprocess.run(cmd, cwd=workdir, env=run_env, check=True)
-            ok = True
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"mdrun failed (exit {e.returncode}). Command: {cli}") from e
+        subprocess.run(cmd, cwd=workdir, env=run_env, check=True)
 
         base = workdir / deffnm_val
         produced = {
@@ -1163,16 +1182,17 @@ class GmxAPI:
             "log": base.with_suffix(".log"),
             "edr": base.with_suffix(".edr"),
             "gro": base.with_suffix(".gro"),
-            "cpt": base.with_suffix(".cpt"),
             "trr": base.with_suffix(".trr"),
             "xtc": base.with_suffix(".xtc"),
         }
         files = {k: str(p) for k, p in produced.items() if p.exists()}
 
-        
-        return SimpleNamespace(files=files, log=cli, cmd=cmd)
+        # Always look for <deffnm>.cpt
+        cpt_path = base.with_suffix(".cpt")
+        if cpt_path.exists():
+            files["cpt"] = str(cpt_path)
 
-        
+        return SimpleNamespace(files=files, log=cli, cmd=cmd)
 
     # ── orchestrator ───────────────────────────────────────────────────────────
 
@@ -1185,6 +1205,7 @@ class GmxAPI:
         - Validates missing required params per step (clear errors).
         - Generic chaining: after any 'mdrun:<phase>' that writes a GRO, ctx['gro'] is updated.
         - Convenience: after any 'grompp:<phase>', ctx['tpr'] and ctx[f'{phase}_tpr'] are updated.
+        - NEW: after any 'mdrun:<phase>', promote checkpoint as ctx['cpt'], ctx[f'{phase}_cpt'], and ctx['checkpoint'].
         """
         import inspect
         from typing import Dict
@@ -1211,7 +1232,6 @@ class GmxAPI:
             for pname, p in sig.parameters.items():
                 if pname == "self":
                     continue
-                # a parameter is "required" if it has no default and isn't *args/**kwargs
                 if (p.default is inspect._empty and
                     p.kind in (
                         inspect.Parameter.POSITIONAL_ONLY,
@@ -1253,7 +1273,7 @@ class GmxAPI:
             elif name == "normalize_atomnames":
                 ctx["gro"] = out.files["gro"]
 
-            # Topology-producing step: set ctx['topol_top'] (+ expose itps if present)
+            # Topology-producing steps
             elif name == "prepare_topology":
                 ctx["forcefield_itp"] = out.files.get("forcefield_itp")
                 ctx["solvent_itp"]    = out.files.get("solvent_itp")
@@ -1263,9 +1283,7 @@ class GmxAPI:
             elif name == "normalize_topol":
                 ctx["topol_top"] = out.files["topol_top"]
 
-            # Generic MD chaining:
-            # - Any 'grompp:<phase>' updates TPR in context.
-            # - Any 'mdrun:<phase>' that yields a GRO updates ctx['gro'] so the next phase uses it.
+            # Generic MD chaining
             if name.startswith("grompp:"):
                 phase = name.split(":", 1)[1] or "md"
                 tpr = out.files.get("tpr")
@@ -1274,9 +1292,19 @@ class GmxAPI:
                     ctx[f"{phase}_tpr"] = tpr        # phase-specific tpr
 
             if name.startswith("mdrun:"):
+                # Hand off final structure to next phase
                 if out.files.get("gro"):
-                    ctx["gro"] = out.files["gro"]    # hand off final structure to next phase
+                    ctx["gro"] = out.files["gro"]
+
+                # NEW: promote checkpoint for next grompp
+                cpt = out.files.get("cpt")
+                if cpt:
+                    ctx["cpt"] = cpt                        # latest checkpoint
+                    phase = name.split(":", 1)[1] or "md"
+                    ctx[f"{phase}_cpt"] = cpt               # phase-specific checkpoint
+                    ctx["checkpoint"] = cpt                  # convenience key consumed by grompp_step
 
         return results
+
 
 
