@@ -108,34 +108,50 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.box is not None and len(args.box) != 3:
         raise ValueError("--box must provide exactly 3 numbers (X Y Z in nm).")
 
-def override_args_with_csv(args: argparse.Namespace) -> argparse.Namespace:
+def override_args_with_csv(args: argparse.Namespace) -> list[argparse.Namespace] | argparse.Namespace:
+    """
+    If --csv is given, return a list of Namespace objects (one per row).
+    Otherwise, return the original args Namespace.
+    """
     if args.csv is not None:
+        arglist = []
         with open(args.csv, newline='') as csvfile:
             reader = csv.DictReader(csvfile)
-            row = next(reader)  # Only first row for now
-            # Override CLI args with CSV values if present
-            if "solute" in row and row["solute"]:
-                args.solute = Path(row["solute"])
-            if "solvent" in row and row["solvent"]:
-                args.solvent = Path(row["solvent"])
-                args.solvent_smiles = None
-            if "solvent_smiles" in row and row["solvent_smiles"]:
-                args.solvent_smiles = row["solvent_smiles"]
-                args.solvent = None
-            if "ratio" in row and row["ratio"]:
-                args.ratio = float(row["ratio"])
-            if "nsolv" in row and row["nsolv"]:
-                args.nsolv = int(row["nsolv"])
-            if "mode" in row and row["mode"]:
-                args.mode = row["mode"]
+            for row in reader:
+                row_args = argparse.Namespace(**vars(args))  # copy
+                if "solute" in row and row["solute"]:
+                    row_args.solute = Path(row["solute"])
+                if "solvent" in row and row["solvent"]:
+                    row_args.solvent = Path(row["solvent"])
+                    row_args.solvent_smiles = None
+                if "solvent_smiles" in row and row["solvent_smiles"]:
+                    row_args.solvent_smiles = row["solvent_smiles"]
+                    row_args.solvent = None
+                if "ratio" in row and row["ratio"]:
+                    row_args.ratio = float(row["ratio"])
+                if "nsolv" in row and row["nsolv"]:
+                    row_args.nsolv = int(row["nsolv"])
+                if "mode" in row and row["mode"]:
+                    row_args.mode = row["mode"]
+                arglist.append(row_args)
+        return arglist
     return args
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    args = override_args_with_csv(args)
+    args_or_list = override_args_with_csv(args)
     setup_logging(args.verbose)
-    return run_workflow(args)  # 👈 delegate all logic
+    if isinstance(args_or_list, list):
+        # Batch mode
+        exit_codes = []
+        for i, row_args in enumerate(args_or_list, 1):
+            print(f"\n[INFO] Running batch {i}/{len(args_or_list)}: {row_args.solute} / {row_args.solvent or row_args.solvent_smiles}")
+            code = run_workflow(row_args)
+            exit_codes.append(code)
+        return max(exit_codes)
+    else:
+        return run_workflow(args_or_list)
 
 
 if __name__ == "__main__":
