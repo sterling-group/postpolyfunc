@@ -101,45 +101,6 @@ def tidy_outputs(workdir: str | Path) -> dict:
 
     return summary
 
-
-def _read_moleculetype_name(itp_path: Path) -> str:
-    txt = Path(itp_path).read_text()
-    m = re.search(r'^\s*\[\s*moleculetype\s*\]\s*(?:;.*)?$([\s\S]*?)(?=^\s*\[|\Z)', txt, re.MULTILINE)
-    if not m:
-        raise ValueError(f"[moleculetype] not found in {itp_path}")
-    for line in m.group(1).splitlines():
-        s = line.strip()
-        if s and not s.startswith((';', '#')):
-            return s.split()[0]
-    raise ValueError(f"Empty [moleculetype] in {itp_path}")
-
-def _rewrite_gro_resname(gro_path: Path, target_resname: str, only_if_name_in: set[str] | None = None) -> int:
-    p = Path(gro_path)
-    lines = p.read_text().splitlines()
-    if len(lines) < 3:
-        raise ValueError(f"Invalid .gro: {gro_path}")
-    title, natoms = lines[0], int(lines[1].strip())
-    atom_lines = lines[2:2+natoms]
-    box_line   = lines[2+natoms] if len(lines) >= 3+natoms else ""
-    tname = (target_resname[:5]).ljust(5)
-
-    changed, fixed = 0, []
-    for L in atom_lines:
-        if len(L) < 20:
-            fixed.append(L); continue
-        resid, resname, atom, atomnr, rest = L[0:5], L[5:10], L[10:15], L[15:20], L[20:]
-        cur = resname.strip()
-        if (only_if_name_in is None) or (cur in only_if_name_in):
-            resid_s  = f"{int(resid):5d}" if resid.strip().isdigit() else resid
-            atomnr_s = f"{int(atomnr):5d}" if atomnr.strip().isdigit() else atomnr
-            fixed.append(f"{resid_s}{tname}{atom}{atomnr_s}{rest}")
-            changed += 1
-        else:
-            fixed.append(L)
-
-    p.write_text("\n".join([title, f"{natoms}", *fixed, box_line]) + "\n")
-    return changed
-
 def run_functionalization(solute_path: Path, outdir: Path, ratio: float, seed: int, mode: str) -> Path:
     atoms = read(solute_path)
     f = PolymerFunctionalizer(functionalization_ratio=ratio, seed=seed, mode=mode)
@@ -198,6 +159,22 @@ def run_workflow(args) -> int:
         opt=args.lp_opt,
         executable=args.lp_exe,
     )
+
+    # After LigParGen: solvent
+    solvent_stem = args.solvent.stem
+    src_gro = outdir / f"{solvent_stem}.gmx.gro"
+    dst_gro = outdir / "solvent.gmx.gro"
+    # if src_gro.exists():
+    #     shutil.copy(src_gro, dst_gro)
+    # else:
+    #     print(f"[ERROR] Expected {src_gro} not found after LigParGen for solvent.")
+
+    src_itp = outdir / f"{solvent_stem}.gmx.itp"
+    dst_itp = outdir / "solvent.gmx.itp"
+    if src_itp.exists():
+        shutil.copy(src_itp, dst_itp)
+    else:
+        print(f"[ERROR] Expected {src_itp} not found after LigParGen for solvent.")
 
     keep_only_root_gmx(outdir)
 
@@ -330,4 +307,4 @@ def run_workflow(args) -> int:
     return 0
 
 
-        
+
