@@ -274,4 +274,8 @@ def generate_parameters(
         timeout_s=timeout_s,
     )
     run_ligpargen(cfg)
+    # Debug: List files in workdir
+    import logging
+    logger = logging.getLogger("postpolyfunc.ligpargen")
+    # logger.info(f"LigParGen output files in {workdir}: {list(workdir.glob('*'))}")
     return collect_outputs(workdir)
