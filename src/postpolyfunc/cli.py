@@ -13,6 +13,7 @@ from .postpolyfunc import run_workflow
 import argparse
 from pathlib import Path
 import csv
+import logging
 
 def _ratio(value: str) -> float:
     x = float(value)
@@ -34,14 +35,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version="postpolyfunc 0.1.0")
 
     # --- I/O paths ---
-    p.add_argument("--solute", required=True, type=Path,
+    p.add_argument("--solute", required=False, type=Path,
                    help="Polymer (solute) structure file (e.g., .pdb or .mol2).")
     p.add_argument("--outdir", type=Path, default=Path("outputs"),
                    help="Output directory (default: outputs).")
     p.add_argument("--csv", type=Path, default=None, help="CSV file to override CLI arguments.")
 
     # --- Solvent definition (choose one) ---
-    g_solvent = p.add_mutually_exclusive_group(required=True)
+    g_solvent = p.add_mutually_exclusive_group(required=False)
     g_solvent.add_argument("--solvent", type=Path,
                            help="Solvent structure file (e.g., LigParGen-ready .pdb/.mol2).")
     g_solvent.add_argument("--solvent-smiles", type=str,
@@ -50,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     # --- Functionalization options ---
     p.add_argument("-r", "--ratio", type=_ratio, default=0.1,
                    help="Fraction of carbon sites to functionalize, (0,1]. Default: 0.1")
-    p.add_argument("--seed", type=int, default=42, help="Random seed (default: 42).")
+    p.add_argument("--seed", type=int, help="Random seed (default: random).")
     p.add_argument("--mode", type=str, default="carbonyl",
                    choices=["carbonyl"], help="Functionalization mode (default: carbonyl).")
 
@@ -73,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     choices=["gmx_mpi", "gmx"],
     help="GROMACS frontend to use (default: gmx_mpi)."
 )
-    p.add_argument("--nsolv", type=_positive_int, required=True,
+    p.add_argument("--nsolv", type=_positive_int, required=False,
                    help="Target number of solvent molecules for the pure solvent box.")
     p.add_argument("--scale", type=float, default=0.33,
                    help="vdW radii scale for packing (gmx solvate -scale). Default: 0.57.")
@@ -119,14 +120,35 @@ def override_args_with_csv(args: argparse.Namespace) -> list[argparse.Namespace]
             reader = csv.DictReader(csvfile)
             for row in reader:
                 row_args = argparse.Namespace(**vars(args))  # copy
+
+                # Handle solute: path or SMILES
                 if "solute" in row and row["solute"]:
-                    row_args.solute = Path(row["solute"])
+                    solute_val = row["solute"]
+                    solute_path = Path(solute_val)
+                    if solute_path.exists():
+                        row_args.solute = solute_path
+                        row_args.solute_smiles = None
+                    else:
+                        row_args.solute = None
+                        row_args.solute_smiles = solute_val
+                elif "solute_smiles" in row and row["solute_smiles"]:
+                    row_args.solute = None
+                    row_args.solute_smiles = row["solute_smiles"]
+
+                # Handle solvent: path or SMILES
                 if "solvent" in row and row["solvent"]:
-                    row_args.solvent = Path(row["solvent"])
-                    row_args.solvent_smiles = None
-                if "solvent_smiles" in row and row["solvent_smiles"]:
-                    row_args.solvent_smiles = row["solvent_smiles"]
+                    solvent_val = row["solvent"]
+                    solvent_path = Path(solvent_val)
+                    if solvent_path.exists():
+                        row_args.solvent = solvent_path
+                        row_args.solvent_smiles = None
+                    else:
+                        row_args.solvent = None
+                        row_args.solvent_smiles = solvent_val
+                elif "solvent_smiles" in row and row["solvent_smiles"]:
                     row_args.solvent = None
+                    row_args.solvent_smiles = row["solvent_smiles"]
+
                 if "ratio" in row and row["ratio"]:
                     row_args.ratio = float(row["ratio"])
                 if "nsolv" in row and row["nsolv"]:
@@ -142,13 +164,67 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     args_or_list = override_args_with_csv(args)
     setup_logging(args.verbose)
+    logger = logging.getLogger("postpolyfunc.batch")
+
+    # Enforce required arguments only if not using CSV
+    if args.csv is None:
+        if args.solute is None:
+            parser.error("--solute is required unless --csv is given.")
+        if args.solvent is None and args.solvent_smiles is None:
+            parser.error("Either --solvent or --solvent-smiles is required unless --csv is given.")
+
     if isinstance(args_or_list, list):
         # Batch mode
         exit_codes = []
         for i, row_args in enumerate(args_or_list, 1):
-            print(f"\n[INFO] Running batch {i}/{len(args_or_list)}: {row_args.solute} / {row_args.solvent or row_args.solvent_smiles}")
-            code = run_workflow(row_args)
+            logger.info(f"=== Batch {i}/{len(args_or_list)} ===")
+            # Create a unique output directory for each row
+            if getattr(row_args, "solute", None):
+                solute_name = Path(row_args.solute).stem
+                solute_path = Path(row_args.solute)
+                if not solute_path.exists():
+                    logger.error(f"Solute file does not exist: {solute_path}")
+                    exit_codes.append(1)
+                    continue
+                logger.info(f"Solute file found: {solute_path}")
+            elif getattr(row_args, "solute_smiles", None):
+                solute_name = row_args.solute_smiles.replace("/", "_").replace("\\", "_")
+                logger.info(f"Solute provided as SMILES: {row_args.solute_smiles}")
+            else:
+                solute_name = "unknown_solute"
+                logger.error("No solute or solute_smiles provided.")
+                exit_codes.append(1)
+                continue
+
+            if getattr(row_args, "solvent", None):
+                solvent_name = Path(row_args.solvent).stem
+                solvent_path = Path(row_args.solvent)
+                if not solvent_path.exists():
+                    logger.error(f"Solvent file does not exist: {solvent_path}")
+                    exit_codes.append(1)
+                    continue
+                logger.info(f"Solvent file found: {solvent_path}")
+            elif getattr(row_args, "solvent_smiles", None):
+                solvent_name = row_args.solvent_smiles.replace("/", "_").replace("\\", "_")
+                logger.info(f"Solvent provided as SMILES: {row_args.solvent_smiles}")
+            else:
+                solvent_name = "unknown_solvent"
+                logger.error("No solvent or solvent_smiles provided.")
+                exit_codes.append(1)
+                continue
+
+            batch_outdir = Path(args.outdir) / f"batch_{i:02d}_{solute_name}_{solvent_name}"
+            row_args.outdir = batch_outdir
+            logger.info(f"Output directory: {row_args.outdir}")
+
+            try:
+                code = run_workflow(row_args)
+                logger.info(f"Batch {i} completed with exit code {code}")
+            except Exception as e:
+                logger.exception(f"Batch {i} failed with exception: {e}")
+                code = 1
             exit_codes.append(code)
+        logger.info(f"Batch run complete. Exit codes: {exit_codes}")
         return max(exit_codes)
     else:
         return run_workflow(args_or_list)
