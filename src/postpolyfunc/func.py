@@ -3,7 +3,7 @@ import random
 from ase import Atoms
 from ase.neighborlist import neighbor_list
 import math
-
+import time
 
 class PolymerFunctionalizer:
     """
@@ -50,7 +50,7 @@ class PolymerFunctionalizer:
         Returns:
         ase.Atoms: The modified supercell with functionalized carbon atoms.
         """
-        random.seed(self.seed)
+        random.seed(self.seed or int(time.time()))
 
         positions = atoms.get_positions()
         symbols = atoms.get_chemical_symbols()
