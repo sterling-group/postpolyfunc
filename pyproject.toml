@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "postpolyfunc"
+version = "0.1.0"
+description = "Tools for post-polymer functionalization workflows"
+authors = [
+    { name="Ignacio Migliaro" }
+]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "ase>=3.22",
+    "numpy",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/postpolyfunc"
+Issues = "https://github.com/yourusername/postpolyfunc/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+postpolyfunc = "postpolyfunc.cli:main"
+
+[tool.setuptools.package-data]
+"postpolyfunc" = ["test/*.pdb"]
