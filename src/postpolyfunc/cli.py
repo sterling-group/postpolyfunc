@@ -134,6 +134,13 @@ def override_args_with_csv(args: argparse.Namespace) -> list[argparse.Namespace]
                 elif "solute_smiles" in row and row["solute_smiles"]:
                     row_args.solute = None
                     row_args.solute_smiles = row["solute_smiles"]
+                # Handle box parameters
+                if "box" in row and row["box"]:
+                    # Allow flexible formats: "12 12 12" or "12,12,12"
+                    box_vals = row["box"].replace(",", " ").split()
+                    if len(box_vals) != 3:
+                        raise ValueError(f"CSV 'box' must have 3 dimensions (got {row['box']})")
+                    row_args.box = [float(x) for x in box_vals]
 
                 # Handle solvent: path or SMILES
                 if "solvent" in row and row["solvent"]:
