@@ -15,6 +15,9 @@ requires-python = ">=3.10"
 dependencies = [
     "ase>=3.22",
     "numpy",
+    "openbabel",
+    "rdkit",
+    "gmxapi",
 ]
 
 [project.urls]
