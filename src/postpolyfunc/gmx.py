@@ -653,6 +653,14 @@ class GmxAPI:
         solute_itp: str | Path,
         solvent_itp: str | Path,
     ):
+        """
+        Replace residue names in GRO using moleculetype names from the ITPs.
+
+        Solute = first N atoms, determined from solute.itp [ atoms ] count.
+        Solvent = remaining atoms.
+
+        Format of GRO fields is preserved exactly.
+        """
         import re
         from pathlib import Path
         from types import SimpleNamespace
@@ -661,61 +669,77 @@ class GmxAPI:
         solute_itp = Path(solute_itp).resolve()
         solvent_itp = Path(solvent_itp).resolve()
 
-        def read_mtype(itp: Path) -> str:
-            txt = itp.read_text()
+        # -------------------------------
+        # 1. Read moleculetype names
+        # -------------------------------
+        def read_mtype(path: Path) -> str:
+            text = path.read_text()
             m = re.search(
-                r'^\s*\[\s*moleculetype\s*\]\s*(?:;.*)?\s*([\s\S]*?)(?=^\s*\[|\Z)',
-                txt,
-                re.MULTILINE
+                r'^\s*\[\s*moleculetype\s*\].*?\n([^;\n][^\n]*)',
+                text,
+                re.MULTILINE | re.DOTALL
             )
             if not m:
-                raise ValueError(f"[moleculetype] not found in {itp}")
+                raise ValueError(f"[moleculetype] not found in {path}")
+            return m.group(1).split()[0]
 
-            for line in m.group(1).splitlines():
-                s = line.strip()
-                if s and not s.startswith((';', '#')):
-                    return s.split()[0]
+        solute_name = read_mtype(solute_itp)
+        solvent_name = read_mtype(solvent_itp)
 
-            raise ValueError(f"Empty [moleculetype] in {itp}")
+        # -------------------------------
+        # 2. Count atoms in solute ITP
+        # -------------------------------
+        def count_atoms(path: Path) -> int:
+            txt = path.read_text().splitlines()
+            in_atoms = False
+            count = 0
+            for line in txt:
+                stripped = line.strip()
+                if stripped.startswith("[") and "atoms" in stripped:
+                    in_atoms = True
+                    continue
+                if in_atoms:
+                    if stripped.startswith("["):
+                        break
+                    if stripped and not stripped.startswith(";"):
+                        count += 1
+            return count
 
-        solute_name = read_mtype(solute_itp)    # e.g. "C6"
-        solvent_name = read_mtype(solvent_itp)  # e.g. "PDC"
+        n_solute_atoms = count_atoms(solute_itp)
 
-        print(f"[INFO] Solute moleculetype:  {solute_name}")
-        print(f"[INFO] Solvent moleculetype: {solvent_name}")
-
+        # -------------------------------
+        # 3. Process GRO
+        # -------------------------------
         lines = gro.read_text().splitlines()
         header, natoms = lines[0], int(lines[1])
-        atom_lines = lines[2:2+natoms]
-
-        # Count solute atoms from solute ITP
-        solute_atoms = 0
-        with open(solute_itp) as f:
-            for line in f:
-                if line.strip().startswith("[ atoms"):
-                    break
-            for line in f:
-                if line.strip().startswith("["):
-                    break
-                if line.strip() and not line.strip().startswith(";"):
-                    solute_atoms += 1
+        atom_lines = lines[2:2 + natoms]
 
         new_lines = [header, str(natoms)]
 
         for i, L in enumerate(atom_lines):
-            # Parse residue number (columns 1-5)
-            resfield = L[:5]
-            resnr = int(resfield[:3])  # first 3 chars = number
-            resname = solute_name if i < solute_atoms else solvent_name
+            atom_index = i + 1  # GRO is 1-indexed
 
-            # Construct correctly formatted field
-            new_resfield = f"{resnr:3d}{resname:<2s}"
+            # Extract residue number robustly (first integer)
+            m = re.match(r"\s*(\d+)", L[:8])
+            if not m:
+                raise ValueError(f"Could not read residue number from: {L}")
+            resnr = int(m.group(1))
 
-            # Replace in line
+            # Decide whether this atom belongs to solute or solvent
+            if atom_index <= n_solute_atoms:
+                newname = solute_name
+            else:
+                newname = solvent_name
+
+            # Construct new field: 3-char resnr + 2-char residue name
+            new_resfield = f"{resnr:3d}{newname:<2s}"
+
+            # Replace only the first 5 characters
             fixed = new_resfield + L[5:]
             new_lines.append(fixed)
 
-        new_lines.extend(lines[2+natoms:])
+        # Copy footer if present
+        new_lines.extend(lines[2 + natoms:])
 
         gro.write_text("\n".join(new_lines))
 
