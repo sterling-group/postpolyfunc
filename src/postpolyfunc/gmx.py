@@ -25,16 +25,6 @@ class StepOutput:
     files: Dict[str, str] = field(default_factory=dict)  # logical key -> absolute path
     meta: Dict[str, Any] = field(default_factory=dict)
 
-RESIDUE_LINE_RE = re.compile(r"""
-    ^\s*
-    (?P<resnr>\d+)      # residue number
-    (?P<resname>[A-Za-z0-9]+)   # residue name (UNL, C6, whatever)
-    \s+
-    (?P<atomname>\S+)
-    \s+
-    (?P<atomnr>\d+)
-""", re.VERBOSE)
-
 @dataclass
 class StepRecord:
         phase: str
@@ -169,27 +159,6 @@ class GmxAPI:
         )
         return p
    
-    def normalize_resnames_to_itp(solute_gro: str | Path,
-                                solvent_gro: str | Path,
-                                solute_itp_out: str | Path,
-                                solvent_itp_out: str | Path) -> tuple[str, str]:
-        """
-        Make .gro residue names match the [ moleculetype ] names in the given .itp files.
-        Returns (solute_name, solvent_name).
-        """
-        solute_gro   = Path(solute_gro)
-        solvent_gro  = Path(solvent_gro)
-        solute_itp   = Path(solute_itp_out)
-        solvent_itp  = Path(solvent_itp_out)
-
-        solute_name  = _read_moleculetype_name(solute_itp)
-        solvent_name = _read_moleculetype_name(solvent_itp)
-
-        _rewrite_gro_resname(solute_gro, solute_name)
-        _rewrite_gro_resname(solvent_gro, solvent_name)
-
-        return solute_name, solvent_name
-
     def solvent_box_step(
     self,
     *,
@@ -725,9 +694,6 @@ class GmxAPI:
 
         new_lines = [header, str(natoms)]
 
-        # ---------------------------------------------------------
-        # 5. Rewrite each atom line
-        # ---------------------------------------------------------
         for i, L in enumerate(atom_lines):
             atom_index = i + 1  # GRO is 1-indexed
 
@@ -753,13 +719,9 @@ class GmxAPI:
         # Copy footer if present
         new_lines.extend(lines[2 + natoms:])
 
-        # ---------------------------------------------------------
-        # 6. Write output
-        # ---------------------------------------------------------
         gro.write_text("\n".join(new_lines))
 
         return SimpleNamespace(files={"gro": gro})
-
 
     def rewrite_gro_resname(gro_path: Path, target_resname: str, only_if: set[str] | None = None) -> int:
         lines = gro_path.read_text().splitlines()
