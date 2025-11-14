@@ -663,16 +663,6 @@ class GmxAPI:
         solvent_itp: str | Path,
     ):
         """
-<<<<<<< HEAD
-        Normalize residue names in a GRO file using moleculetype names from the ITPs.
-
-        Solute = first N atoms (read from solute.itp [ atoms ])
-        Solvent = remaining atoms
-
-        Outputs correct GRO residue fields: {resnr:3d}{resname:<2s}
-        """
-
-=======
         Replace residue names in GRO using moleculetype names from the ITPs.
 
         Solute = first N atoms, determined from solute.itp [ atoms ] count.
@@ -680,7 +670,6 @@ class GmxAPI:
 
         Format of GRO fields is preserved exactly.
         """
->>>>>>> c38031f (add function to replace residue names in GRO using moleculetype names from ITPs)
         import re
         from pathlib import Path
         from types import SimpleNamespace
@@ -689,28 +678,6 @@ class GmxAPI:
         solute_itp = Path(solute_itp).resolve()
         solvent_itp = Path(solvent_itp).resolve()
 
-<<<<<<< HEAD
-        # ---------------------------------------------------------
-        # 1. Read moleculetype names
-        # ---------------------------------------------------------
-        def read_mtype(path: Path) -> str:
-            txt = path.read_text()
-            m = re.search(
-                r'^\s*\[\s*moleculetype\s*\][^\n]*\n\s*([^\s;#]+)',
-                txt,
-                re.MULTILINE
-            )
-            if not m:
-                raise ValueError(f"[moleculetype] not found in {path}")
-            return m.group(1)
-
-        solute_name = read_mtype(solute_itp)     # e.g., "C6"
-        solvent_name = read_mtype(solvent_itp)   # e.g., "PDC"
-
-        # ---------------------------------------------------------
-        # 2. Count number of atoms in solute ITP
-        # ---------------------------------------------------------
-=======
         # -------------------------------
         # 1. Read moleculetype names
         # -------------------------------
@@ -731,7 +698,6 @@ class GmxAPI:
         # -------------------------------
         # 2. Count atoms in solute ITP
         # -------------------------------
->>>>>>> c38031f (add function to replace residue names in GRO using moleculetype names from ITPs)
         def count_atoms(path: Path) -> int:
             txt = path.read_text().splitlines()
             in_atoms = False
@@ -742,42 +708,13 @@ class GmxAPI:
                     in_atoms = True
                     continue
                 if in_atoms:
-<<<<<<< HEAD
-                    if stripped.startswith("["):   # next section
-=======
                     if stripped.startswith("["):
->>>>>>> c38031f (add function to replace residue names in GRO using moleculetype names from ITPs)
                         break
                     if stripped and not stripped.startswith(";"):
                         count += 1
             return count
 
         n_solute_atoms = count_atoms(solute_itp)
-<<<<<<< HEAD
-
-        # ---------------------------------------------------------
-        # 3. GRO parsing regex
-        #    Match: resnr + resname + atomname + atomnr
-        # ---------------------------------------------------------
-        RESLINE = re.compile(r"""
-            ^\s*
-            (?P<resnr>\d+)
-            (?P<resname>[A-Za-z0-9]+)
-            \s+
-            (?P<atomname>\S+)
-            \s+
-            (?P<atomnr>\d+)
-        """, re.VERBOSE)
-
-        # ---------------------------------------------------------
-        # 4. Read GRO file
-        # ---------------------------------------------------------
-        lines = gro.read_text().splitlines()
-        header = lines[0]
-        natoms = int(lines[1])
-        atom_lines = lines[2:2 + natoms]
-        footer = lines[2 + natoms:]
-=======
 
         # -------------------------------
         # 3. Process GRO
@@ -785,7 +722,6 @@ class GmxAPI:
         lines = gro.read_text().splitlines()
         header, natoms = lines[0], int(lines[1])
         atom_lines = lines[2:2 + natoms]
->>>>>>> c38031f (add function to replace residue names in GRO using moleculetype names from ITPs)
 
         new_lines = [header, str(natoms)]
 
@@ -793,39 +729,6 @@ class GmxAPI:
         # 5. Rewrite each atom line
         # ---------------------------------------------------------
         for i, L in enumerate(atom_lines):
-<<<<<<< HEAD
-            atom_index = i + 1
-
-            m = RESLINE.match(L)
-            if not m:
-                raise ValueError(f"Cannot parse GRO atom line:\n{L}")
-
-            resnr = int(m.group("resnr"))
-            oldname = m.group("resname")
-            atomname = m.group("atomname")
-
-            # Decide solute or solvent based purely on atom index
-            if atom_index <= n_solute_atoms:
-                new_resname = solute_name
-            else:
-                new_resname = solvent_name
-
-            # Correct GRO 5-char residue field
-            resfield = f"{resnr:3d}{new_resname:<2s}"
-
-            # Reconstruct line: replace residue field only
-            # Find where atomname starts
-            atomname_start = L.index(atomname)
-
-            # The part before atomname begins at L[:atomname_start]
-            # Replace the first 5 chars with resfield
-            fixed = resfield + L[5:]
-
-            new_lines.append(fixed)
-
-        # Append footer
-        new_lines.extend(footer)
-=======
             atom_index = i + 1  # GRO is 1-indexed
 
             # Extract residue number robustly (first integer)
@@ -849,7 +752,6 @@ class GmxAPI:
 
         # Copy footer if present
         new_lines.extend(lines[2 + natoms:])
->>>>>>> c38031f (add function to replace residue names in GRO using moleculetype names from ITPs)
 
         # ---------------------------------------------------------
         # 6. Write output
