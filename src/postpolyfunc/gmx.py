@@ -652,16 +652,7 @@ class GmxAPI:
         gro: str | Path,
         solute_itp: str | Path,
         solvent_itp: str | Path,
-        ):
-        """
-        Normalize GRO residue names to match ITP moleculetype names.
-        Any residue NOT matching these 2 names will be replaced intelligently:
-
-        - First residue blocks → solute moleculetype
-        - Everything else → solvent moleculetype
-
-        Modifies file in place.
-        """
+    ):
         import re
         from pathlib import Path
         from types import SimpleNamespace
@@ -695,17 +686,13 @@ class GmxAPI:
 
         lines = gro.read_text().splitlines()
         header, natoms = lines[0], int(lines[1])
-
-        new_lines = [header, str(natoms)]
         atom_lines = lines[2:2+natoms]
 
-        # Detect solute block size (atoms belonging to solute)
-        # Assumption: solute comes first, solvent next.
-        # Best: count atoms inside solute_itp.
+        # Count solute atoms from solute ITP
         solute_atoms = 0
         with open(solute_itp) as f:
             for line in f:
-                if line.strip().startswith(("[ atoms ]", "[ atoms]")):
+                if line.strip().startswith("[ atoms"):
                     break
             for line in f:
                 if line.strip().startswith("["):
@@ -713,20 +700,22 @@ class GmxAPI:
                 if line.strip() and not line.strip().startswith(";"):
                     solute_atoms += 1
 
-        # Replace residue names
+        new_lines = [header, str(natoms)]
+
         for i, L in enumerate(atom_lines):
-            resblock = i < solute_atoms
-            new_resname = solute_name if resblock else solvent_name
+            # Parse residue number (columns 1-5)
+            resfield = L[:5]
+            resnr = int(resfield[:3])  # first 3 chars = number
+            resname = solute_name if i < solute_atoms else solvent_name
 
-            # GRO format: residue number (5 chars)
-            # first 5 chars = resnr + resname
-            resnr = L[:5].strip()[:-3] or "1"    # extract number part
-            new_field = f"{int(resnr):3d}{new_resname:>2s}"
+            # Construct correctly formatted field
+            new_resfield = f"{resnr:3d}{resname:<2s}"
 
-            new_L = new_field + L[5:]
-            new_lines.append(new_L)
+            # Replace in line
+            fixed = new_resfield + L[5:]
+            new_lines.append(fixed)
 
-        new_lines.extend(lines[2+natoms:])  # footer if exists
+        new_lines.extend(lines[2+natoms:])
 
         gro.write_text("\n".join(new_lines))
 
