@@ -25,6 +25,15 @@ class StepOutput:
     files: Dict[str, str] = field(default_factory=dict)  # logical key -> absolute path
     meta: Dict[str, Any] = field(default_factory=dict)
 
+RESIDUE_LINE_RE = re.compile(r"""
+    ^\s*
+    (?P<resnr>\d+)      # residue number
+    (?P<resname>[A-Za-z0-9]+)   # residue name (UNL, C6, whatever)
+    \s+
+    (?P<atomname>\S+)
+    \s+
+    (?P<atomnr>\d+)
+""", re.VERBOSE)
 
 @dataclass
 class StepRecord:
@@ -654,13 +663,14 @@ class GmxAPI:
         solvent_itp: str | Path,
     ):
         """
-        Replace residue names in GRO using moleculetype names from the ITPs.
+        Normalize residue names in a GRO file using moleculetype names from the ITPs.
 
-        Solute = first N atoms, determined from solute.itp [ atoms ] count.
-        Solvent = remaining atoms.
+        Solute = first N atoms (read from solute.itp [ atoms ])
+        Solvent = remaining atoms
 
-        Format of GRO fields is preserved exactly.
+        Outputs correct GRO residue fields: {resnr:3d}{resname:<2s}
         """
+
         import re
         from pathlib import Path
         from types import SimpleNamespace
@@ -669,26 +679,26 @@ class GmxAPI:
         solute_itp = Path(solute_itp).resolve()
         solvent_itp = Path(solvent_itp).resolve()
 
-        # -------------------------------
+        # ---------------------------------------------------------
         # 1. Read moleculetype names
-        # -------------------------------
+        # ---------------------------------------------------------
         def read_mtype(path: Path) -> str:
-            text = path.read_text()
+            txt = path.read_text()
             m = re.search(
-                r'^\s*\[\s*moleculetype\s*\].*?\n([^;\n][^\n]*)',
-                text,
-                re.MULTILINE | re.DOTALL
+                r'^\s*\[\s*moleculetype\s*\][^\n]*\n\s*([^\s;#]+)',
+                txt,
+                re.MULTILINE
             )
             if not m:
                 raise ValueError(f"[moleculetype] not found in {path}")
-            return m.group(1).split()[0]
+            return m.group(1)
 
-        solute_name = read_mtype(solute_itp)
-        solvent_name = read_mtype(solvent_itp)
+        solute_name = read_mtype(solute_itp)     # e.g., "C6"
+        solvent_name = read_mtype(solvent_itp)   # e.g., "PDC"
 
-        # -------------------------------
-        # 2. Count atoms in solute ITP
-        # -------------------------------
+        # ---------------------------------------------------------
+        # 2. Count number of atoms in solute ITP
+        # ---------------------------------------------------------
         def count_atoms(path: Path) -> int:
             txt = path.read_text().splitlines()
             in_atoms = False
@@ -699,7 +709,7 @@ class GmxAPI:
                     in_atoms = True
                     continue
                 if in_atoms:
-                    if stripped.startswith("["):
+                    if stripped.startswith("["):   # next section
                         break
                     if stripped and not stripped.startswith(";"):
                         count += 1
@@ -707,43 +717,74 @@ class GmxAPI:
 
         n_solute_atoms = count_atoms(solute_itp)
 
-        # -------------------------------
-        # 3. Process GRO
-        # -------------------------------
+        # ---------------------------------------------------------
+        # 3. GRO parsing regex
+        #    Match: resnr + resname + atomname + atomnr
+        # ---------------------------------------------------------
+        RESLINE = re.compile(r"""
+            ^\s*
+            (?P<resnr>\d+)
+            (?P<resname>[A-Za-z0-9]+)
+            \s+
+            (?P<atomname>\S+)
+            \s+
+            (?P<atomnr>\d+)
+        """, re.VERBOSE)
+
+        # ---------------------------------------------------------
+        # 4. Read GRO file
+        # ---------------------------------------------------------
         lines = gro.read_text().splitlines()
-        header, natoms = lines[0], int(lines[1])
+        header = lines[0]
+        natoms = int(lines[1])
         atom_lines = lines[2:2 + natoms]
+        footer = lines[2 + natoms:]
 
         new_lines = [header, str(natoms)]
 
+        # ---------------------------------------------------------
+        # 5. Rewrite each atom line
+        # ---------------------------------------------------------
         for i, L in enumerate(atom_lines):
-            atom_index = i + 1  # GRO is 1-indexed
+            atom_index = i + 1
 
-            # Extract residue number robustly (first integer)
-            m = re.match(r"\s*(\d+)", L[:8])
+            m = RESLINE.match(L)
             if not m:
-                raise ValueError(f"Could not read residue number from: {L}")
-            resnr = int(m.group(1))
+                raise ValueError(f"Cannot parse GRO atom line:\n{L}")
 
-            # Decide whether this atom belongs to solute or solvent
+            resnr = int(m.group("resnr"))
+            oldname = m.group("resname")
+            atomname = m.group("atomname")
+
+            # Decide solute or solvent based purely on atom index
             if atom_index <= n_solute_atoms:
-                newname = solute_name
+                new_resname = solute_name
             else:
-                newname = solvent_name
+                new_resname = solvent_name
 
-            # Construct new field: 3-char resnr + 2-char residue name
-            new_resfield = f"{resnr:3d}{newname:<2s}"
+            # Correct GRO 5-char residue field
+            resfield = f"{resnr:3d}{new_resname:<2s}"
 
-            # Replace only the first 5 characters
-            fixed = new_resfield + L[5:]
+            # Reconstruct line: replace residue field only
+            # Find where atomname starts
+            atomname_start = L.index(atomname)
+
+            # The part before atomname begins at L[:atomname_start]
+            # Replace the first 5 chars with resfield
+            fixed = resfield + L[5:]
+
             new_lines.append(fixed)
 
-        # Copy footer if present
-        new_lines.extend(lines[2 + natoms:])
+        # Append footer
+        new_lines.extend(footer)
 
+        # ---------------------------------------------------------
+        # 6. Write output
+        # ---------------------------------------------------------
         gro.write_text("\n".join(new_lines))
 
         return SimpleNamespace(files={"gro": gro})
+
 
     def rewrite_gro_resname(gro_path: Path, target_resname: str, only_if: set[str] | None = None) -> int:
         lines = gro_path.read_text().splitlines()
