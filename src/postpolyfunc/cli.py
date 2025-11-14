@@ -17,7 +17,7 @@ import logging
 
 def _ratio(value: str) -> float:
     x = float(value)
-    if not (0.0 < x <= 1.0):
+    if not (0.0 <= x <= 1.0):
         raise argparse.ArgumentTypeError("ratio must be in (0, 1].")
     return x
 
