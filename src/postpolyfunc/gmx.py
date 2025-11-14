@@ -160,46 +160,6 @@ class GmxAPI:
         )
         return p
    
-        """
-        Rewrite the resname (columns 6–10) of every atom line in a .gro file to target_resname.
-        Keeps fixed-width formatting per GROMACS convention.
-        """
-        lines = gro_path.read_text().splitlines()
-        if len(lines) < 3:
-            raise ValueError(f"Not a valid .gro: {gro_path}")
-
-        title = lines[0]
-        natoms = int(lines[1].strip())
-        atom_lines = lines[2:2+natoms]
-        box_line = lines[2+natoms] if len(lines) >= 3+natoms else ""
-
-        tname = (target_resname[:5]).ljust(5)  # GRO resname is width 5
-
-        fixed = []
-        for L in atom_lines:
-            # GRO atom line canonical layout:
-            # %5d %-5s %5s %5d %8.3f %8.3f %8.3f (plus optional v fields)
-            # We’ll parse minimally and rebuild the left part with fixed widths,
-            # then append any trailing coords/velocities as-is.
-            if len(L) < 20:
-                fixed.append(L)  # leave weird lines untouched
-                continue
-            resid   = L[0:5]
-            resname = L[5:10]
-            atom    = L[10:15]
-            atomnr  = L[15:20]
-            rest    = L[20:]  # includes coords (and velocities if present)
-
-            # normalize resid and atomnr spacing
-            resid_s  = f"{int(resid):5d}" if resid.strip().isdigit() else resid
-            atomnr_s = f"{int(atomnr):5d}" if atomnr.strip().isdigit() else atomnr
-
-            newL = f"{resid_s}{tname}{atom}{atomnr_s}{rest}"
-            fixed.append(newL)
-
-        out = [title, f"{natoms}"] + fixed + [box_line]
-        gro_path.write_text("\n".join(out) + "\n")
-
     def normalize_resnames_to_itp(solute_gro: str | Path,
                                 solvent_gro: str | Path,
                                 solute_itp_out: str | Path,
@@ -692,13 +652,15 @@ class GmxAPI:
         gro: str | Path,
         solute_itp: str | Path,
         solvent_itp: str | Path,
-    ):
+        ):
         """
-        Normalize the combined GRO’s residue names *in place* to the moleculetype names
-        from the ITPs. Changes only resnames that are generic:
-        MOL  -> <solute moleculetype>
-        SOL/WAT/HOH -> <solvent moleculetype>
-        Returns an object with .files['gro'] so orchestrate can promote it.
+        Normalize GRO residue names to match ITP moleculetype names.
+        Any residue NOT matching these 2 names will be replaced intelligently:
+
+        - First residue blocks → solute moleculetype
+        - Everything else → solvent moleculetype
+
+        Modifies file in place.
         """
         import re
         from pathlib import Path
@@ -708,43 +670,94 @@ class GmxAPI:
         solute_itp = Path(solute_itp).resolve()
         solvent_itp = Path(solvent_itp).resolve()
 
-        def read_mtype(p: Path) -> str:
-            txt = p.read_text()
-            m = re.search(r'^\s*\[\s*moleculetype\s*\]\s*(?:;.*)?$([\s\S]*?)(?=^\s*\[|\Z)', txt, re.MULTILINE)
+        def read_mtype(itp: Path) -> str:
+            txt = itp.read_text()
+            m = re.search(
+                r'^\s*\[\s*moleculetype\s*\]\s*(?:;.*)?\s*([\s\S]*?)(?=^\s*\[|\Z)',
+                txt,
+                re.MULTILINE
+            )
             if not m:
-                raise ValueError(f"[moleculetype] not found in {p}")
+                raise ValueError(f"[moleculetype] not found in {itp}")
+
             for line in m.group(1).splitlines():
                 s = line.strip()
                 if s and not s.startswith((';', '#')):
                     return s.split()[0]
-            raise ValueError(f"Empty [moleculetype] in {p}")
 
-        def rewrite_gro_resname(gro_path: Path, target_resname: str, only_if: set[str] | None = None) -> int:
-            lines = gro_path.read_text().splitlines()
-            if len(lines) < 3:
-                raise ValueError(f"Invalid .gro: {gro_path}")
-            title, natoms = lines[0], int(lines[1].strip())
-            atom_lines = lines[2:2+natoms]
-            box_line   = lines[2+natoms] if len(lines) >= 3+natoms else ""
-            tname = (target_resname[:5]).ljust(5)
+            raise ValueError(f"Empty [moleculetype] in {itp}")
 
-            changed = 0
-            fixed = []
-            for L in atom_lines:
-                if len(L) < 20:
-                    fixed.append(L); continue
-                resid, resname, atom, atomnr, rest = L[0:5], L[5:10], L[10:15], L[15:20], L[20:]
-                cur = resname.strip()
-                if (only_if is None) or (cur in only_if):
-                    resid_s  = f"{int(resid):5d}" if resid.strip().isdigit() else resid
-                    atomnr_s = f"{int(atomnr):5d}" if atomnr.strip().isdigit() else atomnr
-                    fixed.append(f"{resid_s}{tname}{atom}{atomnr_s}{rest}")
-                    changed += 1
-                else:
-                    fixed.append(L)
+        solute_name = read_mtype(solute_itp)    # e.g. "C6"
+        solvent_name = read_mtype(solvent_itp)  # e.g. "PDC"
 
-            gro_path.write_text("\n".join([title, f"{natoms}", *fixed, box_line]) + "\n")
-            return changed
+        print(f"[INFO] Solute moleculetype:  {solute_name}")
+        print(f"[INFO] Solvent moleculetype: {solvent_name}")
+
+        lines = gro.read_text().splitlines()
+        header, natoms = lines[0], int(lines[1])
+
+        new_lines = [header, str(natoms)]
+        atom_lines = lines[2:2+natoms]
+
+        # Detect solute block size (atoms belonging to solute)
+        # Assumption: solute comes first, solvent next.
+        # Best: count atoms inside solute_itp.
+        solute_atoms = 0
+        with open(solute_itp) as f:
+            for line in f:
+                if line.strip().startswith(("[ atoms ]", "[ atoms]")):
+                    break
+            for line in f:
+                if line.strip().startswith("["):
+                    break
+                if line.strip() and not line.strip().startswith(";"):
+                    solute_atoms += 1
+
+        # Replace residue names
+        for i, L in enumerate(atom_lines):
+            resblock = i < solute_atoms
+            new_resname = solute_name if resblock else solvent_name
+
+            # GRO format: residue number (5 chars)
+            # first 5 chars = resnr + resname
+            resnr = L[:5].strip()[:-3] or "1"    # extract number part
+            new_field = f"{int(resnr):3d}{new_resname:>2s}"
+
+            new_L = new_field + L[5:]
+            new_lines.append(new_L)
+
+        new_lines.extend(lines[2+natoms:])  # footer if exists
+
+        gro.write_text("\n".join(new_lines))
+
+        return SimpleNamespace(files={"gro": gro})
+
+    def rewrite_gro_resname(gro_path: Path, target_resname: str, only_if: set[str] | None = None) -> int:
+        lines = gro_path.read_text().splitlines()
+        if len(lines) < 3:
+            raise ValueError(f"Invalid .gro: {gro_path}")
+        title, natoms = lines[0], int(lines[1].strip())
+        atom_lines = lines[2:2+natoms]
+        box_line   = lines[2+natoms] if len(lines) >= 3+natoms else ""
+        tname = (target_resname[:5]).ljust(5)
+
+        changed = 0
+        fixed = []
+        for L in atom_lines:
+            if len(L) < 20:
+                fixed.append(L); continue
+            resid, resname, atom, atomnr, rest = L[0:5], L[5:10], L[10:15], L[15:20], L[20:]
+            cur = resname.strip()
+            if (only_if is None) or (cur in only_if):
+                resid_s  = f"{int(resid):5d}" if resid.strip().isdigit() else resid
+                atomnr_s = f"{int(atomnr):5d}" if atomnr.strip().isdigit() else atomnr
+                fixed.append(f"{resid_s}{tname}{atom}{atomnr_s}{rest}")
+                changed += 1
+            else:
+                fixed.append(L)
+
+        gro_path.write_text("\n".join([title, f"{natoms}", *fixed, box_line]) + "\n")
+        return changed
 
         solute_name  = read_mtype(solute_itp)
         solvent_name = read_mtype(solvent_itp)
