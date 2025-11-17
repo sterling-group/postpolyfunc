@@ -1186,7 +1186,7 @@ class GmxAPI:
     *,
     tpr: str | Path | None = None,  # if omitted, defaults to <phase>.tpr
     deffnm: str | None = None,      # if omitted, defaults to <phase>
-    np: int = 8,
+    np: int = 1,
     ntomp: int | None = None,
     extra_args: list[str] | None = None,
     env: dict | None = None,
