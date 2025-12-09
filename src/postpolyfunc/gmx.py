@@ -1164,9 +1164,9 @@ class GmxAPI:
     tpr: str | Path | None = None,  # if omitted, defaults to <phase>.tpr
     deffnm: str | None = None,      # if omitted, defaults to <phase>
     np: int = 1,
-    ntomp: int | None = None,
     extra_args: list[str] | None = None,
     env: dict | None = None,
+    gpu_id: int | None = None,
     phase: str = "em",
 ):
         """
@@ -1184,22 +1184,25 @@ class GmxAPI:
             raise FileNotFoundError("mpirun not found in PATH.")
         if shutil.which(self.executable) is None:
             raise FileNotFoundError(f"GROMACS executable '{self.executable}' not found in PATH.")
-
+        
         cmd = [
             "mpirun", "-np", str(np),
             self.executable, "mdrun",
             "-s", str(tpr_path),
             "-deffnm", str(deffnm_val),
             "-v",
+         
         ]
-        if ntomp is not None:
-            cmd += ["-ntomp", str(ntomp)]
+        
+        if gpu_id is not None:
+            cmd += ["-gpu_id", str(gpu_id)]
+            
+        
         if extra_args:
             cmd += list(map(str, extra_args))
 
         run_env = os.environ.copy()
-        if ntomp is not None:
-            run_env.setdefault("OMP_NUM_THREADS", str(ntomp))
+       
         if env:
             run_env.update({str(k): str(v) for k, v in env.items()})
 

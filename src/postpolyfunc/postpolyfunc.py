@@ -223,8 +223,7 @@ def run_workflow(args) -> int:
     "mdrun:em": {
         "tpr": outdir / "em.tpr",   # defaults to em.tpr anyway; ok to keep explicit
         "deffnm": "min",
-        "np": 8,
-        "ntomp": 2,
+        "gpu_id": args.gpu_id,
         "extra_args": ["-pin", "on"],
     },
 
@@ -232,14 +231,15 @@ def run_workflow(args) -> int:
     "grompp:nvt": {
         "mdp": Path(args.nvt_mdp),
         "out_tpr": outdir / "nvt.tpr",
+        "gpu_id": args.gpu_id,
         "mdout_mdp": outdir / "nvt.mdout.mdp",
         "maxwarn": 1,
     },
     "mdrun:nvt": {
         "tpr": outdir / "nvt.tpr",
         "deffnm": "nvt",
-        "np": 8,
-        "ntomp": 2,
+        "gpu_id": args.gpu_id,
+        "np": 1,
         "extra_args": ["-pin", "on"],
     },
 
@@ -253,8 +253,8 @@ def run_workflow(args) -> int:
     "mdrun:npt": ({
         "tpr": outdir / "npt.tpr",
         "deffnm": "npt",
-        "np": 8,
-        "ntomp": 2,
+        "np": 1,
+        "gpu_id": args.gpu_id,
         "extra_args": ["-pin", "on"],
     } if getattr(args, "npt_mdp", None) else {}),
 
@@ -262,7 +262,7 @@ def run_workflow(args) -> int:
     "grompp:prod": ({
         "mdp": Path(args.prod_mdp),
         "out_tpr": outdir / "prod.tpr",
-        "mdout_mdp": outdir / "prod.mdout.mdp",  # <-- fixed (was npt.mdout.mdp)
+        "mdout_mdp": outdir / "prod.mdout.mdp",  
         "maxwarn": 1,
     } if getattr(args, "prod_mdp", None) else {}),
 }

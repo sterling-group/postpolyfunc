@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--outdir", type=Path, default=Path("outputs"),
                    help="Output directory (default: outputs).")
     p.add_argument("--csv", type=Path, default=None, help="CSV file to override CLI arguments.")
-
+    p.add_argument("--gpu_id",type=int,default=None,help="GPU ID to use for MD (if applicable).")
     # --- Solvent definition (choose one) ---
     g_solvent = p.add_mutually_exclusive_group(required=False)
     g_solvent.add_argument("--solvent", type=Path,
@@ -219,8 +219,9 @@ def main(argv: list[str] | None = None) -> int:
                 logger.error("No solvent or solvent_smiles provided.")
                 exit_codes.append(1)
                 continue
-
-            batch_outdir = Path(args.outdir) / f"batch_{i:02d}_{solute_name}_{solvent_name}"
+            
+            ratio_str = f"r{int(row_args.ratio * 1000):03d}"  # e.g., 0.10 → r100, 0.025 → r025
+            batch_outdir = Path(args.outdir) / f"batch_{i:02d}_{solute_name}_{solvent_name}_{ratio_str}"
             row_args.outdir = batch_outdir
             logger.info(f"Output directory: {row_args.outdir}")
 
