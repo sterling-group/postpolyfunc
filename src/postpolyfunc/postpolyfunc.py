@@ -129,6 +129,13 @@ def run_workflow(args) -> int:
         mode=args.mode,
     )
     print(f"[INFO] Functionalized polymer saved to: {func_path}")
+    
+    # ============================================================
+    # Functionalization-only mode: stop here
+    # ============================================================
+    if getattr(args, "functionalize_only", False):
+        print("[INFO] --functionalize-only set. Skipping LigParGen, solvent, and GMX.")
+        return 0
 
     if args.skip_ligpargen:
         print("[INFO] LigParGen skipped.")

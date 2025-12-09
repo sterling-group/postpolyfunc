@@ -41,6 +41,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Output directory (default: outputs).")
     p.add_argument("--csv", type=Path, default=None, help="CSV file to override CLI arguments.")
     p.add_argument("--gpu_id",type=int,default=None,help="GPU ID to use for MD (if applicable).")
+    p.add_argument(
+    "--functionalize-only",
+    action="store_true",
+    help="Only functionalize the polymer and exit (no LigParGen, no solvent, no GROMACS)."
+)
     # --- Solvent definition (choose one) ---
     g_solvent = p.add_mutually_exclusive_group(required=False)
     g_solvent.add_argument("--solvent", type=Path,
