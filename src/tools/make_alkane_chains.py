@@ -2,22 +2,37 @@
 import argparse
 import subprocess
 import random
-from typing import List, Set
+from typing import List, Set, Tuple, Dict
 
 
 def build_functionalized_smiles(
     n: int,
     func_ratio: float,
     seed: int | None,
-    allow_terminal: bool
-) -> tuple[str, List[int]]:
+    allow_terminal: bool,
+    func_type: str,
+    oh_frac: float,
+) -> tuple[str, List[int], List[int]]:
+    """
+    Build SMILES for a linear carbon backbone where selected positions are functionalized.
+
+    Returns:
+      smiles,
+      carbonyl_positions (1-indexed),
+      hydroxyl_positions (1-indexed)
+    """
     if not (0.0 <= func_ratio <= 1.0):
         raise ValueError("--func-ratio must be between 0.0 and 1.0")
+    if func_type not in {"carbonyl", "hydroxyl", "mixed"}:
+        raise ValueError("--func-type must be one of: carbonyl, hydroxyl, mixed")
+    if not (0.0 <= oh_frac <= 1.0):
+        raise ValueError("--oh-frac must be between 0.0 and 1.0")
 
     rng = random.Random(seed)
 
+    # 1-indexed positions along the backbone
     if allow_terminal:
-        eligible = list(range(1, n + 1))          # 1-indexed
+        eligible = list(range(1, n + 1))
     else:
         eligible = list(range(2, n)) if n >= 3 else []
 
@@ -27,17 +42,37 @@ def build_functionalized_smiles(
     chosen: Set[int] = set(rng.sample(eligible, k)) if k > 0 else set()
     chosen_sorted = sorted(chosen)
 
+    carbonyl_positions: List[int] = []
+    hydroxyl_positions: List[int] = []
+
+    if func_type == "carbonyl":
+        carbonyl_positions = chosen_sorted
+    elif func_type == "hydroxyl":
+        hydroxyl_positions = chosen_sorted
+    else:
+        # mixed: split chosen into OH vs carbonyl
+        n_oh = int(round(oh_frac * len(chosen_sorted)))
+        n_oh = min(n_oh, len(chosen_sorted))
+        oh_set = set(rng.sample(chosen_sorted, n_oh)) if n_oh > 0 else set()
+        hydroxyl_positions = sorted(oh_set)
+        carbonyl_positions = sorted(set(chosen_sorted) - oh_set)
+
     tokens: List[str] = []
     for i in range(1, n + 1):
-        tokens.append("C(=O)" if i in chosen else "C")
+        if i in carbonyl_positions:
+            tokens.append("C(=O)")   # ketone-like insertion
+        elif i in hydroxyl_positions:
+            tokens.append("C(O)")    # alcohol substituent on backbone carbon
+        else:
+            tokens.append("C")
 
     smiles = "".join(tokens)
-    return smiles, chosen_sorted
+    return smiles, carbonyl_positions, hydroxyl_positions
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate a linear chain with optional random C=O functionalization using Open Babel."
+        description="Generate a linear chain with optional random functionalization using Open Babel."
     )
     parser.add_argument("n", type=int, help="Number of carbons in the backbone (e.g., 20).")
 
@@ -54,15 +89,26 @@ def main():
 
     parser.add_argument(
         "--func-ratio", type=float, default=0.0,
-        help="Fraction of backbone carbons to convert into carbonyls as C(=O). Example: 0.10."
+        help="Fraction of backbone positions to functionalize (0.0–1.0). Example: 0.10."
     )
+    parser.add_argument(
+        "--func-type",
+        choices=["carbonyl", "hydroxyl", "mixed"],
+        default="carbonyl",
+        help="Functional group type to apply at selected positions."
+    )
+    parser.add_argument(
+        "--oh-frac", type=float, default=0.5,
+        help="Only used if --func-type mixed. Fraction of functionalized sites that become hydroxyl (0.0–1.0)."
+    )
+
     parser.add_argument(
         "--seed", type=int, default=None,
         help="Random seed for reproducibility (optional)."
     )
     parser.add_argument(
         "--allow-terminal", action="store_true",
-        help="Allow carbonyls at terminal carbons (creates aldehyde ends). Default: internal only."
+        help="Allow functional groups at terminal carbons. Default: internal only."
     )
 
     args = parser.parse_args()
@@ -71,18 +117,24 @@ def main():
     if n < 1:
         raise ValueError("n must be ≥ 1")
 
-    smiles, chosen_positions = build_functionalized_smiles(
+    smiles, carbonyl_pos, hydroxyl_pos = build_functionalized_smiles(
         n=n,
         func_ratio=args.func_ratio,
         seed=args.seed,
         allow_terminal=args.allow_terminal,
+        func_type=args.func_type,
+        oh_frac=args.oh_frac,
     )
 
     ratio_tag = int(round(args.func_ratio * 100))
 
     # Auto outfile name if not provided
     if args.outfile is None:
-        outfile = f"C{n}_{ratio_tag}.{args.format}"
+        # include func-type tag in filename
+        tag = args.func_type
+        if args.func_type == "mixed":
+            tag = f"mixed_oh{int(round(args.oh_frac * 100))}"
+        outfile = f"C{n}_{ratio_tag}_{tag}.{args.format}"
     else:
         outfile = args.outfile
 
@@ -90,20 +142,19 @@ def main():
     if "." not in outfile.split("/")[-1]:
         outfile = f"{outfile}.{args.format}"
 
-    # Explicitly set output format (-opdb/-ocml/-omol2) so it matches args.format
     cmd = ["obabel", f"-:{smiles}", f"-o{args.format}", "-O", outfile, "--gen3D", "-h"]
 
     print(f"[INFO] Backbone n={n}")
     print(f"[INFO] Functionalization ratio={args.func_ratio:.3f} (seed={args.seed})")
-    print(f"[INFO] Carbonyl positions (1-indexed): {chosen_positions if chosen_positions else 'None'}")
+    print(f"[INFO] func-type={args.func_type} (oh-frac={args.oh_frac if args.func_type=='mixed' else 'n/a'})")
+    print(f"[INFO] Carbonyl positions (1-indexed): {carbonyl_pos if carbonyl_pos else 'None'}")
+    print(f"[INFO] Hydroxyl positions (1-indexed): {hydroxyl_pos if hydroxyl_pos else 'None'}")
     print(f"[INFO] SMILES: {smiles}")
     print(f"[INFO] Running: {' '.join(cmd)}")
 
     subprocess.run(cmd, check=True)
-
     print(f"[OK] Wrote {outfile}")
 
 
 if __name__ == "__main__":
     main()
-
